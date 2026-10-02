@@ -15,6 +15,7 @@ import (
 	"net/netip"
 	"sync"
 	"syscall"
+	"time"
 )
 
 const (
@@ -27,15 +28,18 @@ const (
 	DefaultPart1WGSize        = 80
 )
 
-// EvasionConfig configures the 5-packet evasion mechanism
+// EvasionConfig configures the evasion mechanism
 type EvasionConfig struct {
-	Enabled       bool // Enable L3 fragmentation and fake TTL
-	FakeTTL       int  // TTL for the fake MF=0 terminating fragment (default: 3)
-	PreJunkSize   int  // Size in bytes of pre-junk UDP datagram (default: 64, 0 to disable)
-	PreJunkBadsum bool // If true, uses corrupted UDP checksum on pre-junk
-	NormalTTL     int  // TTL for legitimate fragments (default: 64)
-	Debug         bool // Enable verbose evasion debugging logs
-	VerbosePacket bool // Log every data packet
+	Enabled       bool   // Enable L3 fragmentation and fake TTL
+	FakeTTL       int    // TTL for the fake MF=0 terminating fragment (default: 3)
+	PreJunkSize   int    // Size in bytes of pre-junk UDP datagram (default: 64, 0 to disable)
+	PreJunkBadsum bool   // If true, uses corrupted UDP checksum on pre-junk
+	NormalTTL     int    // TTL for legitimate fragments (default: 64)
+	Strategy      string // DSL strategy pipeline (e.g. "junk(64) -> frag(8) -> ...")
+	Debug         bool   // Enable verbose evasion debugging logs
+	VerbosePacket bool   // Log every data packet
+
+	compiledStrategy *Strategy
 }
 
 func DefaultEvasionConfig() EvasionConfig {
@@ -45,6 +49,7 @@ func DefaultEvasionConfig() EvasionConfig {
 		PreJunkSize:   64,
 		PreJunkBadsum: false,
 		NormalTTL:     64,
+		Strategy:      "default",
 		Debug:         true,
 		VerbosePacket: false,
 	}
@@ -62,6 +67,16 @@ type EvasionBind struct {
 
 // NewEvasionBind wraps any Bind with our L3 early-termination desync engine
 func NewEvasionBind(base Bind, cfg EvasionConfig) *EvasionBind {
+	// Compile the strategy pipeline
+	strat, err := ParseStrategy(cfg.Strategy, cfg.FakeTTL, cfg.NormalTTL)
+	if err != nil {
+		if cfg.Debug {
+			log.Printf("[TRAVONET-WG] ⚠️ Invalid strategy '%s': %v (falling back to default)", cfg.Strategy, err)
+		}
+		strat = DefaultStrategy(cfg.FakeTTL, cfg.NormalTTL)
+	}
+	cfg.compiledStrategy = strat
+
 	b := &EvasionBind{
 		Bind:  base,
 		cfg:   cfg,
@@ -79,6 +94,7 @@ func NewEvasionBind(base Bind, cfg EvasionConfig) *EvasionBind {
 			b.rawFd = rawFd
 			if cfg.Debug {
 				log.Printf("[TRAVONET-WG] 🛡️ L3 Evasion Raw Socket initialized (IP_NODEFRAG=1, IP_HDRINCL=1)")
+				log.Printf("[TRAVONET-WG] 📜 Active Evasion Strategy: %s", strat.String())
 			}
 		}
 	}
@@ -250,74 +266,130 @@ func (b *EvasionBind) sendObfuscatedHandshake(rawFd int, localPort int, ep Endpo
 	udpChecksum := computeUDPChecksum(srcIP, dstIP, udpHeader, wgPayload)
 	binary.BigEndian.PutUint16(udpHeader[6:8], udpChecksum)
 
-	// 1. Packet 1: Pre-junk UDP packet
-	if b.cfg.PreJunkSize > 0 {
-		junkPayload := make([]byte, b.cfg.PreJunkSize)
-		rand.Read(junkPayload)
+	// Assemble unfragmented UDP datagram: 8B UDP header + 148B WG handshake = 156B
+	fullDatagram := append(udpHeader, wgPayload...)
+	currentOffset := 0
 
-		junkUDPHeader := make([]byte, UDPHeaderSize)
-		binary.BigEndian.PutUint16(junkUDPHeader[0:2], uint16(srcPort))
-		binary.BigEndian.PutUint16(junkUDPHeader[2:4], uint16(dstPort))
-		binary.BigEndian.PutUint16(junkUDPHeader[4:6], uint16(UDPHeaderSize+len(junkPayload)))
+	strategy := b.cfg.compiledStrategy
+	if strategy == nil {
+		strategy = DefaultStrategy(b.cfg.FakeTTL, b.cfg.NormalTTL)
+	}
 
-		if b.cfg.PreJunkBadsum {
-			binary.BigEndian.PutUint16(junkUDPHeader[6:8], 0xBADC)
-		} else {
-			junkCsum := computeUDPChecksum(srcIP, dstIP, junkUDPHeader, junkPayload)
-			binary.BigEndian.PutUint16(junkUDPHeader[6:8], junkCsum)
+	for i, step := range strategy.Steps {
+		switch step.Action {
+		case ActionJunk:
+			junkPayload := make([]byte, step.Length)
+			rand.Read(junkPayload)
+
+			junkUDPHeader := make([]byte, UDPHeaderSize)
+			binary.BigEndian.PutUint16(junkUDPHeader[0:2], uint16(srcPort))
+			binary.BigEndian.PutUint16(junkUDPHeader[2:4], uint16(dstPort))
+			binary.BigEndian.PutUint16(junkUDPHeader[4:6], uint16(UDPHeaderSize+len(junkPayload)))
+
+			if step.Badsum {
+				binary.BigEndian.PutUint16(junkUDPHeader[6:8], 0xBADC)
+			} else {
+				junkCsum := computeUDPChecksum(srcIP, dstIP, junkUDPHeader, junkPayload)
+				binary.BigEndian.PutUint16(junkUDPHeader[6:8], junkCsum)
+			}
+
+			var junkIDBuf [2]byte
+			rand.Read(junkIDBuf[:])
+			junkID := binary.BigEndian.Uint16(junkIDBuf[:])
+
+			ttl := step.TTL
+			if ttl <= 0 {
+				ttl = b.cfg.NormalTTL
+			}
+
+			junkPkt := buildIPv4Packet(srcIP, dstIP, junkID, ttl, false, 0, append(junkUDPHeader, junkPayload...))
+			if err := sendRawPacket(rawFd, dstIP, junkPkt); err != nil {
+				return fmt.Errorf("step %d (junk) send: %w", i+1, err)
+			}
+
+		case ActionFrag:
+			offset := step.Offset
+			if offset < 0 {
+				offset = currentOffset
+			}
+			length := step.Length
+			if offset+length > len(fullDatagram) {
+				length = len(fullDatagram) - offset
+			}
+			if length <= 0 {
+				continue
+			}
+
+			slice := fullDatagram[offset : offset+length]
+			mf := step.MF
+			if step.AutoMF {
+				mf = (offset+length < len(fullDatagram))
+			}
+
+			ttl := step.TTL
+			if ttl <= 0 {
+				ttl = b.cfg.NormalTTL
+			}
+
+			fragPkt := buildIPv4Packet(srcIP, dstIP, ipID, ttl, mf, offset, slice)
+			if err := sendRawPacket(rawFd, dstIP, fragPkt); err != nil {
+				return fmt.Errorf("step %d (frag) send: %w", i+1, err)
+			}
+			currentOffset = offset + length
+
+		case ActionFakeFrag:
+			offset := step.Offset
+			if offset < 0 {
+				offset = currentOffset
+			}
+			fakePayload := make([]byte, step.Length)
+			rand.Read(fakePayload)
+
+			ttl := step.TTL
+			if ttl <= 0 {
+				ttl = b.cfg.FakeTTL
+			}
+
+			fakePkt := buildIPv4Packet(srcIP, dstIP, ipID, ttl, step.MF, offset, fakePayload)
+			if err := sendRawPacket(rawFd, dstIP, fakePkt); err != nil {
+				return fmt.Errorf("step %d (fake_frag) send: %w", i+1, err)
+			}
+
+		case ActionFakeUDP:
+			fakePayload := make([]byte, step.Length)
+			rand.Read(fakePayload)
+
+			fakeUDPHeader := make([]byte, UDPHeaderSize)
+			binary.BigEndian.PutUint16(fakeUDPHeader[0:2], uint16(srcPort))
+			binary.BigEndian.PutUint16(fakeUDPHeader[2:4], uint16(dstPort))
+			binary.BigEndian.PutUint16(fakeUDPHeader[4:6], uint16(UDPHeaderSize+len(fakePayload)))
+
+			if step.Badsum {
+				binary.BigEndian.PutUint16(fakeUDPHeader[6:8], 0xBADC)
+			} else {
+				csum := computeUDPChecksum(srcIP, dstIP, fakeUDPHeader, fakePayload)
+				binary.BigEndian.PutUint16(fakeUDPHeader[6:8], csum)
+			}
+
+			var fakeIDBuf [2]byte
+			rand.Read(fakeIDBuf[:])
+			fakeID := binary.BigEndian.Uint16(fakeIDBuf[:])
+
+			ttl := step.TTL
+			if ttl <= 0 {
+				ttl = b.cfg.FakeTTL
+			}
+
+			pkt := buildIPv4Packet(srcIP, dstIP, fakeID, ttl, false, 0, append(fakeUDPHeader, fakePayload...))
+			if err := sendRawPacket(rawFd, dstIP, pkt); err != nil {
+				return fmt.Errorf("step %d (fake_udp) send: %w", i+1, err)
+			}
+
+		case ActionSleep:
+			if step.SleepDur > 0 {
+				time.Sleep(step.SleepDur)
+			}
 		}
-
-		var junkIDBuf [2]byte
-		rand.Read(junkIDBuf[:])
-		junkID := binary.BigEndian.Uint16(junkIDBuf[:])
-
-		junkPkt := buildIPv4Packet(srcIP, dstIP, junkID, b.cfg.NormalTTL, false, 0, append(junkUDPHeader, junkPayload...))
-		if err := sendRawPacket(rawFd, dstIP, junkPkt); err != nil {
-			return fmt.Errorf("pre-junk send: %w", err)
-		}
-	}
-
-	// 2. Packet 2: Fragment 1 (UDP Header only, Offset 0, MF=1, TTL=normal)
-	frag1Pkt := buildIPv4Packet(srcIP, dstIP, ipID, b.cfg.NormalTTL, true, 0, udpHeader)
-	if err := sendRawPacket(rawFd, dstIP, frag1Pkt); err != nil {
-		return fmt.Errorf("fragment 1 send: %w", err)
-	}
-
-	// 3. Packet 3: Fragment 2 (First 80 bytes of WG, Offset 8B (1), MF=1, TTL=normal)
-	part1 := wgPayload[:DefaultPart1WGSize]
-	frag2Pkt := buildIPv4Packet(srcIP, dstIP, ipID, b.cfg.NormalTTL, true, UDPHeaderSize, part1)
-	if err := sendRawPacket(rawFd, dstIP, frag2Pkt); err != nil {
-		return fmt.Errorf("fragment 2 send: %w", err)
-	}
-
-	// 4. Packet 4: Fake Fragment (MF=0 Early Termination, low TTL=fakeTTL, 32B noise)
-	fakePayload := make([]byte, 32)
-	rand.Read(fakePayload)
-
-	fakePkt := buildIPv4Packet(
-		srcIP, dstIP,
-		ipID,
-		b.cfg.FakeTTL,
-		false,                            // MF = 0 (Crucial for DPI cache poisoning)
-		UDPHeaderSize+DefaultPart1WGSize, // Offset = 88B (11)
-		fakePayload,
-	)
-	if err := sendRawPacket(rawFd, dstIP, fakePkt); err != nil {
-		return fmt.Errorf("fake fragment send: %w", err)
-	}
-
-	// 5. Packet 5: Fragment 3 (Final 68 bytes of WG, Offset 88B (11), MF=0, TTL=normal)
-	part2 := wgPayload[DefaultPart1WGSize:]
-	frag3Pkt := buildIPv4Packet(
-		srcIP, dstIP,
-		ipID,
-		b.cfg.NormalTTL,
-		false,                            // MF = 0 (Real termination for WG server)
-		UDPHeaderSize+DefaultPart1WGSize, // Offset = 88B (11)
-		part2,
-	)
-	if err := sendRawPacket(rawFd, dstIP, frag3Pkt); err != nil {
-		return fmt.Errorf("fragment 3 send: %w", err)
 	}
 
 	return nil

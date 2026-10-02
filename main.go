@@ -34,7 +34,7 @@ const (
 )
 
 func printUsage() {
-	fmt.Printf("Usage: %s [-f/--foreground] [-d/--debug] [--fake-ttl N] [--pre-junk N] [--no-evasion] INTERFACE-NAME\n", os.Args[0])
+	fmt.Printf("Usage: %s [-f/--foreground] [-d/--debug] [--strategy \"...\"] [--fake-ttl N] [--pre-junk N] [--no-evasion] INTERFACE-NAME\n", os.Args[0])
 }
 
 func warning() {
@@ -75,6 +75,12 @@ func main() {
 	if os.Getenv("WG_NO_EVASION") == "1" {
 		evasionCfg.Enabled = false
 	}
+	if strat := os.Getenv("WG_STRATEGY"); strat != "" {
+		evasionCfg.Strategy = strat
+	}
+	if strat := os.Getenv("TRAVONET_STRATEGY"); strat != "" {
+		evasionCfg.Strategy = strat
+	}
 
 	for i := 1; i < len(os.Args); i++ {
 		arg := os.Args[i]
@@ -85,6 +91,11 @@ func main() {
 			debug = true
 		case "--no-evasion":
 			evasionCfg.Enabled = false
+		case "-s", "--strategy", "-strategy":
+			if i+1 < len(os.Args) {
+				i++
+				evasionCfg.Strategy = os.Args[i]
+			}
 		case "--fake-ttl":
 			if i+1 < len(os.Args) {
 				i++
@@ -111,6 +122,13 @@ func main() {
 	if interfaceName == "" {
 		printUsage()
 		return
+	}
+
+	if evasionCfg.Strategy != "" && evasionCfg.Strategy != "default" {
+		if _, err := conn.ParseStrategy(evasionCfg.Strategy, evasionCfg.FakeTTL, evasionCfg.NormalTTL); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: invalid evasion strategy: %v\n", err)
+			os.Exit(ExitSetupFailed)
+		}
 	}
 
 	if !foreground {
