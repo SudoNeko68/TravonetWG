@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"runtime"
 	"strconv"
+	"strings"
 
 	"golang.org/x/sys/unix"
 	"golang.zx2c4.com/wireguard/conn"
@@ -33,7 +34,7 @@ const (
 )
 
 func printUsage() {
-	fmt.Printf("Usage: %s [-f/--foreground] INTERFACE-NAME\n", os.Args[0])
+	fmt.Printf("Usage: %s [-f/--foreground] [-d/--debug] [--fake-ttl N] [--pre-junk N] [--no-evasion] INTERFACE-NAME\n", os.Args[0])
 }
 
 func warning() {
@@ -48,56 +49,81 @@ func warning() {
 
 	fmt.Fprintln(os.Stderr, "┌──────────────────────────────────────────────────────┐")
 	fmt.Fprintln(os.Stderr, "│                                                      │")
-	fmt.Fprintln(os.Stderr, "│   Running wireguard-go is not required because this  │")
-	fmt.Fprintln(os.Stderr, "│   kernel has first class support for WireGuard. For  │")
-	fmt.Fprintln(os.Stderr, "│   information on installing the kernel module,       │")
-	fmt.Fprintln(os.Stderr, "│   please visit:                                      │")
-	fmt.Fprintln(os.Stderr, "│         https://www.wireguard.com/install/           │")
+	fmt.Fprintln(os.Stderr, "│   TravonetWG: Custom WireGuard with L3 Evasion       │")
+	fmt.Fprintln(os.Stderr, "│   Early-termination Desync against TSPU / DPI        │")
 	fmt.Fprintln(os.Stderr, "│                                                      │")
 	fmt.Fprintln(os.Stderr, "└──────────────────────────────────────────────────────┘")
 }
 
 func main() {
 	if len(os.Args) == 2 && os.Args[1] == "--version" {
-		fmt.Printf("wireguard-go v%s\n\nUserspace WireGuard daemon for %s-%s.\nInformation available at https://www.wireguard.com.\nCopyright (C) Jason A. Donenfeld <Jason@zx2c4.com>.\n", Version, runtime.GOOS, runtime.GOARCH)
+		fmt.Printf("TravonetWG (wireguard-go v%s)\n\nCustom Userspace WireGuard with L3 early-termination evasion for %s-%s.\n", Version, runtime.GOOS, runtime.GOARCH)
 		return
 	}
 
 	warning()
 
 	var foreground bool
+	var debug bool
 	var interfaceName string
-	if len(os.Args) < 2 || len(os.Args) > 3 {
-		printUsage()
-		return
+	evasionCfg := conn.DefaultEvasionConfig()
+
+	// Environment variable overrides
+	if os.Getenv("WG_DEBUG") == "1" || os.Getenv("TRAVONET_DEBUG") == "1" || os.Getenv("LOG_LEVEL") == "verbose" {
+		debug = true
+	}
+	if os.Getenv("WG_NO_EVASION") == "1" {
+		evasionCfg.Enabled = false
 	}
 
-	switch os.Args[1] {
-
-	case "-f", "--foreground":
-		foreground = true
-		if len(os.Args) != 3 {
-			printUsage()
-			return
+	for i := 1; i < len(os.Args); i++ {
+		arg := os.Args[i]
+		switch arg {
+		case "-f", "--foreground":
+			foreground = true
+		case "-d", "--debug", "-debug":
+			debug = true
+		case "--no-evasion":
+			evasionCfg.Enabled = false
+		case "--fake-ttl":
+			if i+1 < len(os.Args) {
+				i++
+				if ttl, err := strconv.Atoi(os.Args[i]); err == nil {
+					evasionCfg.FakeTTL = ttl
+				}
+			}
+		case "--pre-junk":
+			if i+1 < len(os.Args) {
+				i++
+				if sz, err := strconv.Atoi(os.Args[i]); err == nil {
+					evasionCfg.PreJunkSize = sz
+				}
+			}
+		default:
+			if strings.HasPrefix(arg, "-") {
+				printUsage()
+				return
+			}
+			interfaceName = arg
 		}
-		interfaceName = os.Args[2]
+	}
 
-	default:
-		foreground = false
-		if len(os.Args) != 2 {
-			printUsage()
-			return
-		}
-		interfaceName = os.Args[1]
+	if interfaceName == "" {
+		printUsage()
+		return
 	}
 
 	if !foreground {
 		foreground = os.Getenv(ENV_WG_PROCESS_FOREGROUND) == "1"
 	}
 
-	// get log level (default: info)
+	evasionCfg.Debug = debug
 
+	// get log level
 	logLevel := func() int {
+		if debug {
+			return device.LogLevelVerbose
+		}
 		switch os.Getenv("LOG_LEVEL") {
 		case "verbose", "debug":
 			return device.LogLevelVerbose
@@ -222,7 +248,8 @@ func main() {
 		return
 	}
 
-	device := device.NewDevice(tdev, conn.NewDefaultBind(), logger)
+	bind := conn.NewEvasionBind(conn.NewDefaultBind(), evasionCfg)
+	device := device.NewDevice(tdev, bind, logger)
 
 	logger.Verbosef("Device started")
 
