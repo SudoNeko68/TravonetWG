@@ -101,7 +101,9 @@ func ParseConfigFile(path string) (*Config, error) {
 			case "strategy":
 				cfg.Strategy = val
 			case "fakettl", "fake_ttl":
-				if ttl, err := strconv.Atoi(val); err == nil {
+				if strings.EqualFold(val, "auto") {
+					cfg.FakeTTL = -1
+				} else if ttl, err := strconv.Atoi(val); err == nil {
 					cfg.FakeTTL = ttl
 				}
 			case "prejunk", "pre_junk", "prejunksize":

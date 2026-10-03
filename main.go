@@ -86,6 +86,10 @@ func main() {
 		evasionCfg.Strategy = strat
 	}
 
+	var cliFakeTTL int = 0
+	var cliStrategy string
+	var cliPreJunk int = -1
+
 	for i := 1; i < len(os.Args); i++ {
 		arg := os.Args[i]
 		switch arg {
@@ -103,20 +107,23 @@ func main() {
 		case "-s", "--strategy", "-strategy":
 			if i+1 < len(os.Args) {
 				i++
+				cliStrategy = os.Args[i]
 				evasionCfg.Strategy = os.Args[i]
 			}
 		case "--fake-ttl":
 			if i+1 < len(os.Args) {
 				i++
-				if ttl, err := strconv.Atoi(os.Args[i]); err == nil {
-					evasionCfg.FakeTTL = ttl
+				if strings.EqualFold(os.Args[i], "auto") {
+					cliFakeTTL = -1
+				} else if ttl, err := strconv.Atoi(os.Args[i]); err == nil {
+					cliFakeTTL = ttl
 				}
 			}
 		case "--pre-junk":
 			if i+1 < len(os.Args) {
 				i++
 				if sz, err := strconv.Atoi(os.Args[i]); err == nil {
-					evasionCfg.PreJunkSize = sz
+					cliPreJunk = sz
 				}
 			}
 		default:
@@ -145,15 +152,43 @@ func main() {
 			interfaceName = strings.TrimSuffix(base, ext)
 		}
 
-		// Apply evasion overrides from config file
-		if cfg.Strategy != "" && evasionCfg.Strategy == "default" {
+		// Apply evasion overrides from config file (CLI flags take precedence)
+		if cliStrategy != "" {
+			evasionCfg.Strategy = cliStrategy
+		} else if cfg.Strategy != "" {
 			evasionCfg.Strategy = cfg.Strategy
 		}
-		if cfg.FakeTTL > 0 {
+
+		if cliFakeTTL != 0 {
+			evasionCfg.FakeTTL = cliFakeTTL
+		} else if cfg.FakeTTL != 0 {
 			evasionCfg.FakeTTL = cfg.FakeTTL
 		}
-		if cfg.PreJunkSize > 0 {
+
+		if cliPreJunk >= 0 {
+			evasionCfg.PreJunkSize = cliPreJunk
+		} else if cfg.PreJunkSize > 0 {
 			evasionCfg.PreJunkSize = cfg.PreJunkSize
+		}
+	}
+
+	// Auto-measure target TTL if requested (FakeTTL <= 0) and endpoint is known
+	if evasionCfg.Enabled && evasionCfg.FakeTTL <= 0 && parsedConfig != nil && parsedConfig.Endpoint != "" {
+		if debug {
+			fmt.Printf("DEBUG: (evasion) [TRAVONET-WG] 📏 Measuring hop distance to endpoint %s...\n", parsedConfig.Endpoint)
+		}
+		totalHops, recommendedTTL, err := conn.MeasureTargetTTL(parsedConfig.Endpoint)
+		if err == nil {
+			evasionCfg.FakeTTL = recommendedTTL
+			if debug {
+				fmt.Printf("DEBUG: (evasion) [TRAVONET-WG] 🎯 Auto-measured %d hops to endpoint, setting FakeTTL = %d (DPI bypass zone: 8-%d)\n",
+					totalHops, recommendedTTL, recommendedTTL)
+			}
+		} else {
+			evasionCfg.FakeTTL = 11 // Fallback default
+			if debug {
+				fmt.Printf("DEBUG: (evasion) [TRAVONET-WG] ⚠️ Auto-measure failed: %v (falling back to FakeTTL = 11)\n", err)
+			}
 		}
 	}
 
