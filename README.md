@@ -1,77 +1,179 @@
-# Go Implementation of [WireGuard](https://www.wireguard.com/)
+# TravonetWG 🚀
 
-This is an implementation of WireGuard in Go.
+[![Go Version](https://img.shields.io/badge/Go-1.22%2B-blue.svg)](https://go.dev)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![WireGuard Compatible](https://img.shields.io/badge/WireGuard-100%25%20Server%20Compatible-brightgreen.svg)](https://www.wireguard.com)
 
-## Usage
+**TravonetWG** is an advanced in-client L3 evasion fork of [`wireguard-go`](https://git.zx2c4.com/wireguard-go). It bypasses deep packet inspection (TSPU / DPI) in restrictive network environments without requiring any server-side changes, special patches, or non-standard protocols.
 
-Most Linux kernel WireGuard users are used to adding an interface with `ip link add wg0 type wireguard`. With wireguard-go, instead simply run:
+---
 
-```
-$ wireguard-go wg0
-```
+## 🌟 Key Differences from AmneziaWG (AWG)
 
-This will create an interface and fork into the background. To remove the interface, use the usual `ip link del wg0`, or if your system does not support removing interfaces directly, you may instead remove the control socket via `rm -f /var/run/wireguard/wg0.sock`, which will result in wireguard-go shutting down.
+| Feature | AmneziaWG (AWG) | TravonetWG |
+| :--- | :--- | :--- |
+| **Server Requirements** | Requires custom, patched AWG server | **100% standard unpatched WireGuard servers** (Cloudflare WARP, standard VPS, commercial WG) |
+| **Evasion Layer** | L4/L7 protocol obfuscation (Magic headers H1-H4, S1-S2) | **L3 (IP layer)** via raw sockets with `IP_HDRINCL` and `IP_NODEFRAG` |
+| **TSPU Bypass Vector** | Scrambles packet headers | Splits transport headers from payload (`frag(8)` + `frag(148)`) + DPI-terminating fake packets (`fake_udp`) |
+| **Wire Traffic** | Still sends intact 148B UDP datagrams if magic headers are disabled | The 148B packet **never exists intact on the wire** during DPI inspection |
+| **Configuration** | Custom config keys (`Jc`, `Jmin`, `H1`...) | **Dual-mode:** Custom keys in `.conf` **OR** 100% pure vanilla WireGuard `.conf` |
 
-To run wireguard-go without forking to the background, pass `-f` or `--foreground`:
+---
 
-```
-$ wireguard-go -f wg0
-```
+## 🛠️ How It Works: The Proven Evasion Pipeline
 
-When an interface is running, you may use [`wg(8)`](https://git.zx2c4.com/wireguard-tools/about/src/man/wg.8) to configure it, as well as the usual `ip(8)` and `ifconfig(8)` commands.
+During a standard WireGuard connection, the client sends a distinct 148-byte UDP packet (`0x01` handshake initiation). TSPU boxes detect the 148-byte length on UDP ports and block the flow.
 
-To run with more logging you may set the environment variable `LOG_LEVEL=debug`.
-
-## Platforms
-
-### Linux
-
-This will run on Linux; however you should instead use the kernel module, which is faster and better integrated into the OS. See the [installation page](https://www.wireguard.com/install/) for instructions.
-
-### macOS
-
-This runs on macOS using the utun driver. It does not yet support sticky sockets, and won't support fwmarks because of Darwin limitations. Since the utun driver cannot have arbitrary interface names, you must either use `utun[0-9]+` for an explicit interface name or `utun` to have the kernel select one for you. If you choose `utun` as the interface name, and the environment variable `WG_TUN_NAME_FILE` is defined, then the actual name of the interface chosen by the kernel is written to the file specified by that variable.
-
-### Windows
-
-This runs on Windows, but you should instead use it from the more [fully featured Windows app](https://git.zx2c4.com/wireguard-windows/about/), which uses this as a module.
-
-### FreeBSD
-
-This will run on FreeBSD. It does not yet support sticky sockets. Fwmark is mapped to `SO_USER_COOKIE`.
-
-### OpenBSD
-
-This will run on OpenBSD. It does not yet support sticky sockets. Fwmark is mapped to `SO_RTABLE`. Since the tun driver cannot have arbitrary interface names, you must either use `tun[0-9]+` for an explicit interface name or `tun` to have the program select one for you. If you choose `tun` as the interface name, and the environment variable `WG_TUN_NAME_FILE` is defined, then the actual name of the interface chosen by the kernel is written to the file specified by that variable.
-
-## Building
-
-This requires an installation of the latest version of [Go](https://go.dev/).
+TravonetWG intercepts handshake initiation packets at the raw socket level and executes an evasion pipeline:
 
 ```
-$ git clone https://git.zx2c4.com/wireguard-go
-$ cd wireguard-go
-$ make
+[Client] ──(1) junk UDP datagram (64B)─────────────────────────────► [DPI] (confused flow)
+         ──(2) fake UDP handshake (148B, TTL=10..11)───────────────► [TSPU / DPI] (state poisoned) ───X (dies before server)
+         ──(3) Frag #1 (offset=0, len=8, MF=1, TTL=64)────────────► [TSPU / DPI] ───► [WireGuard Server]
+         ──(4) Frag #2 (offset=8, len=148, MF=0, TTL=64)──────────► [TSPU / DPI] ───► [WireGuard Server]
 ```
 
-## License
+1. **Pre-Junk (`junk(64)`):** A small random UDP datagram precedes the handshake, disrupting DPI protocol-matching heuristics.
+2. **Fake UDP (`fake_udp(148, ttl=auto)`):** A complete 148-byte UDP datagram with `0x01` initiation byte sent with a low TTL (calculated by Auto-TTL). It reaches the ISP's TSPU box (hops 8–11), registers inside the DPI's state table, and expires in transit before reaching the destination server.
+3. **Transport Split Fragmentation (`frag(8)` + `frag(148)`):**
+   - Fragment 1 contains **only** the 8-byte UDP header (no WireGuard data).
+   - Fragment 2 contains the 148-byte WireGuard payload without UDP ports.
+   - Intermediate routers and NAT reassemble standard RFC 791 fragments cleanly, and the standard WireGuard server receives the full, legitimate Handshake Initiation packet.
 
-    Copyright (C) 2017-2025 WireGuard LLC. All Rights Reserved.
-    
-    Permission is hereby granted, free of charge, to any person obtaining a copy of
-    this software and associated documentation files (the "Software"), to deal in
-    the Software without restriction, including without limitation the rights to
-    use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
-    of the Software, and to permit persons to whom the Software is furnished to do
-    so, subject to the following conditions:
-    
-    The above copyright notice and this permission notice shall be included in all
-    copies or substantial portions of the Software.
-    
-    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-    SOFTWARE.
+---
+
+## ⚙️ Dual Configuration Modes
+
+TravonetWG provides two distinct modes depending on your preference:
+
+### Mode 1: Embedded Evasion Settings in `.conf`
+Add evasion directives directly inside the `[Interface]` section of your WireGuard configuration:
+
+```ini
+[Interface]
+PrivateKey = <your_private_key>
+Address = 172.16.0.2/32
+DNS = 1.1.1.1
+MTU = 1280
+
+# Evasion directives:
+FakeTTL = auto
+PreJunk = 64
+Strategy = junk(64) -> fake_udp(148) -> frag(8) -> frag(148)
+
+[Peer]
+PublicKey = <server_public_key>
+Endpoint = 8.34.70.70:500
+AllowedIPs = 0.0.0.0/0
+PersistentKeepalive = 25
+```
+
+Launch with:
+```bash
+sudo ./travonet-wg -f -c warp.conf warp
+```
+
+---
+
+### Mode 2: Vanilla WireGuard `.conf` + CLI Flags (or Zero-Config)
+Use a **100% standard, unpatched WireGuard `.conf` file** (e.g., exported directly from Cloudflare WARP, Mullvad, ProtonVPN, or standard `wg-quick`):
+
+```ini
+[Interface]
+PrivateKey = <your_private_key>
+Address = 172.16.0.2/32
+DNS = 1.1.1.1
+MTU = 1280
+
+[Peer]
+PublicKey = <server_public_key>
+Endpoint = 8.34.70.70:500
+AllowedIPs = 0.0.0.0/0
+PersistentKeepalive = 25
+```
+
+#### Option A: Zero-Config (Intelligent Auto-Detection)
+Pass no evasion flags. TravonetWG will automatically probe the hop distance to the endpoint, configure Auto-TTL, and run the proven default evasion pipeline:
+```bash
+sudo ./travonet-wg -f -c clean-warp.conf warp
+```
+
+#### Option B: CLI Parameter Overrides
+Override parameters on the command line (CLI flags always take highest precedence):
+```bash
+# Auto-measure TTL:
+sudo ./travonet-wg -f -c clean-warp.conf --fake-ttl auto warp
+
+# Specific custom TTL:
+sudo ./travonet-wg -f -c clean-warp.conf --fake-ttl 10 warp
+
+# Custom evasion pipeline:
+sudo ./travonet-wg -f -c clean-warp.conf -s "junk(64) -> fake_udp(148) -> frag(8) -> frag(148)" warp
+
+# Disable evasion completely (run as standard wireguard-go):
+sudo ./travonet-wg -f -c clean-warp.conf --no-evasion warp
+```
+
+---
+
+## 📏 Auto-TTL Hop Distance Probe
+
+Because TSPU DPI hardware is located within domestic transit/backbone networks (typically hops 8–11 in Russia), fake packets must have a TTL large enough to traverse TSPU, but small enough to expire before reaching the foreign server.
+
+TravonetWG includes a built-in traceroute engine (`conn.MeasureTargetTTL`) that:
+- Probes the network path to the endpoint in ~1 second using non-invasive UDP/ICMP bursts.
+- Determines total hop count (e.g. 15 hops to Cloudflare Stockholm).
+- Computes optimal `FakeTTL = totalHops - 4` (constrained within the Russian DPI bypass window: 8–11).
+
+---
+
+## 📜 Strategy DSL Syntax
+
+TravonetWG features a domain-specific language (DSL) to customize packet sequences:
+
+| Action | Description | Example |
+| :--- | :--- | :--- |
+| `junk(size, [badsum])` | Sends a random UDP packet | `junk(64)`, `junk(size=128, badsum=true)` |
+| `fake_udp(size, [ttl])` | Full UDP datagram with `0x01` initiation header | `fake_udp(148)`, `fake_udp(size=148, ttl=10)` |
+| `frag(offset, len, [mf, ttl])` | Legitimate IP fragment of the handshake | `frag(8)`, `frag(offset=0, len=8, mf=true)` |
+| `fake_frag(offset, len, [mf, ttl])` | Injected fake fragment | `fake_frag(offset=88, len=32, mf=0, ttl=10)` |
+| `sleep(duration)` | Timing delay between packets | `sleep(10ms)` |
+
+---
+
+## 🚀 Building & Running
+
+### Prerequisites
+- Linux with Go 1.22+ installed
+- Root permissions (required for raw sockets and TUN interface creation)
+
+### Build
+```bash
+git clone https://github.com/SudoNeko68/TravonetWG.git
+cd TravonetWG
+go build -o travonet-wg .
+```
+
+### Full System VPN Launcher (`run_warp.sh`)
+To route all system internet traffic and DNS through Cloudflare WARP using TravonetWG:
+```bash
+# Mode 1 (embedded config):
+sudo ./run_warp.sh warp.conf
+
+# Mode 2 (vanilla config + auto evasion):
+sudo ./run_warp.sh clean-warp.conf
+
+# Mode 2 with CLI override:
+sudo ./run_warp.sh clean-warp.conf --fake-ttl 10
+```
+
+Verify your connection:
+```bash
+curl https://cloudflare.com/cdn-cgi/trace
+# Expected: warp=on, loc=RU, colo=ARN
+```
+
+---
+
+## 📄 License
+MIT License. Copyright (C) 2017-2025 WireGuard LLC. Copyright (C) 2026 TravonetWG Contributors.
