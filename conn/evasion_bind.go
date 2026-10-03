@@ -87,14 +87,14 @@ func NewEvasionBind(base Bind, cfg EvasionConfig) *EvasionBind {
 		rawFd, err := initRawSocket()
 		if err != nil {
 			if cfg.Debug {
-				log.Printf("[TRAVONET-WG] ⚠️ Notice: Raw socket initialization: %v (requires root/CAP_NET_RAW)", err)
-				log.Printf("[TRAVONET-WG] ⚠️ L3 evasion will be skipped unless granted CAP_NET_RAW")
+				fmt.Printf("DEBUG: (evasion) [TRAVONET-WG] ⚠️ Notice: Raw socket initialization failed: %v (requires root/CAP_NET_RAW)\n", err)
+				fmt.Printf("DEBUG: (evasion) [TRAVONET-WG] ⚠️ L3 evasion will be skipped unless granted CAP_NET_RAW\n")
 			}
 		} else {
 			b.rawFd = rawFd
 			if cfg.Debug {
-				log.Printf("[TRAVONET-WG] 🛡️ L3 Evasion Raw Socket initialized (IP_NODEFRAG=1, IP_HDRINCL=1)")
-				log.Printf("[TRAVONET-WG] 📜 Active Evasion Strategy: %s", strat.String())
+				fmt.Printf("DEBUG: (evasion) [TRAVONET-WG] 🛡️ L3 Evasion Raw Socket initialized (IP_NODEFRAG=1, IP_HDRINCL=1)\n")
+				fmt.Printf("DEBUG: (evasion) [TRAVONET-WG] 📜 Active Evasion Strategy: %s\n", strat.String())
 			}
 		}
 	}
@@ -151,12 +151,12 @@ func (b *EvasionBind) wrapReceiveFunc(fn ReceiveFunc) ReceiveFunc {
 					msgType := packets[j][0]
 					switch msgType {
 					case 2: // Handshake Response (92 bytes)
-						log.Printf("[TRAVONET-WG DEBUG] 🟢 <<< RECEIVED HANDSHAKE RESPONSE (Type 2, %d bytes) from %s! Handshake succeeded, tunnel is UP!", sz, eps[j].DstToString())
+						fmt.Printf("DEBUG: (evasion) [TRAVONET-WG] 🟢 <<< RECEIVED HANDSHAKE RESPONSE (Type 2, %d bytes) from %s! Handshake succeeded, tunnel is UP!\n", sz, eps[j].DstToString())
 					case 3: // Cookie Reply
-						log.Printf("[TRAVONET-WG DEBUG] 🍪 <<< Received Cookie Reply from %s", eps[j].DstToString())
+						fmt.Printf("DEBUG: (evasion) [TRAVONET-WG] 🍪 <<< Received Cookie Reply from %s\n", eps[j].DstToString())
 					case 4: // Transport Data
 						if b.cfg.VerbosePacket {
-							log.Printf("[TRAVONET-WG DEBUG] 📥 <<< Transport Data (%d bytes) from %s", sz, eps[j].DstToString())
+							fmt.Printf("DEBUG: (evasion) [TRAVONET-WG] 📥 <<< Transport Data (%d bytes) from %s\n", sz, eps[j].DstToString())
 						}
 					}
 				}
@@ -185,6 +185,9 @@ func (b *EvasionBind) Send(bufs [][]byte, ep Endpoint) error {
 
 	// If raw socket is not available or evasion disabled, standard send
 	if !b.cfg.Enabled || rawFd < 0 || ep.DstIP().Is6() {
+		if b.cfg.Debug && len(bufs) > 0 && len(bufs[0]) == WGHandshakeInitiationSize && bufs[0][0] == 0x01 {
+			fmt.Printf("DEBUG: (evasion) [TRAVONET-WG] ⚠️ Evasion skipped (enabled=%v, rawFd=%d, isIPv6=%v), sending standard packet\n", b.cfg.Enabled, rawFd, ep.DstIP().Is6())
+		}
 		return b.Bind.Send(bufs, ep)
 	}
 
@@ -193,18 +196,18 @@ func (b *EvasionBind) Send(bufs [][]byte, ep Endpoint) error {
 		// WireGuard Handshake Initiation is strictly 148 bytes with Type = 0x01
 		if len(buf) == WGHandshakeInitiationSize && buf[0] == 0x01 {
 			if b.cfg.Debug {
-				log.Printf("[TRAVONET-WG DEBUG] 🚀 >>> Handshake Initiation detected (148 bytes) to %s", ep.DstToString())
+				fmt.Printf("DEBUG: (evasion) [TRAVONET-WG] 🚀 >>> Handshake Initiation detected (148 bytes) to %s\n", ep.DstToString())
 			}
 
 			err := b.sendObfuscatedHandshake(rawFd, int(actualPort), ep, buf)
 			if err != nil {
 				if b.cfg.Debug {
-					log.Printf("[TRAVONET-WG DEBUG] ❌ Evasion send failed: %v (falling back to standard send)", err)
+					fmt.Printf("DEBUG: (evasion) [TRAVONET-WG] ❌ Evasion send failed: %v (falling back to standard send)\n", err)
 				}
 				standardBufs = append(standardBufs, buf)
 			} else {
 				if b.cfg.Debug {
-					log.Printf("[TRAVONET-WG DEBUG] ✅ 5-packet evasion sequence sent successfully to %s!", ep.DstToString())
+					fmt.Printf("DEBUG: (evasion) [TRAVONET-WG] ✅ 5-packet evasion sequence sent successfully to %s!\n", ep.DstToString())
 				}
 			}
 		} else {
