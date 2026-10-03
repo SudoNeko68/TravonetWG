@@ -53,6 +53,7 @@ type SOCKS5Server struct {
 	closed   bool
 	wg       sync.WaitGroup
 	Debug    bool
+	conns    map[net.Conn]struct{}
 }
 
 // NewSOCKS5Server creates a new SOCKS5 proxy server
@@ -60,6 +61,7 @@ func NewSOCKS5Server(addr string, dialCtx DialContextFunc) *SOCKS5Server {
 	return &SOCKS5Server{
 		addr:    addr,
 		dialCtx: dialCtx,
+		conns:   make(map[net.Conn]struct{}),
 	}
 }
 
@@ -91,9 +93,23 @@ func (s *SOCKS5Server) ListenAndServe() error {
 			return err
 		}
 
+		s.mu.Lock()
+		if s.closed {
+			s.mu.Unlock()
+			conn.Close()
+			return nil
+		}
+		s.conns[conn] = struct{}{}
+		s.mu.Unlock()
+
 		s.wg.Add(1)
 		go func(c net.Conn) {
-			defer s.wg.Done()
+			defer func() {
+				s.mu.Lock()
+				delete(s.conns, c)
+				s.mu.Unlock()
+				s.wg.Done()
+			}()
 			s.handleConnection(c)
 		}(conn)
 	}
@@ -111,8 +127,23 @@ func (s *SOCKS5Server) Close() error {
 	if s.listener != nil {
 		err = s.listener.Close()
 	}
+	for c := range s.conns {
+		_ = c.Close()
+	}
+	s.conns = make(map[net.Conn]struct{})
 	s.mu.Unlock()
-	s.wg.Wait()
+
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(1 * time.Second):
+	}
+
 	return err
 }
 

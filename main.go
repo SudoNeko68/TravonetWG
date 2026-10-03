@@ -19,6 +19,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 
 	"golang.org/x/sys/unix"
 	"golang.zx2c4.com/wireguard/conf"
@@ -550,6 +551,12 @@ func main() {
 	case <-device.Wait():
 	}
 
+	// Force exit immediately if signal is received again during shutdown
+	go func() {
+		<-term
+		os.Exit(130)
+	}()
+
 	// clean up
 
 	uapi.Close()
@@ -677,7 +684,25 @@ func runSocks5Userspace(socks5Addr string, parsedConfig *conf.Config, evasionCfg
 
 	<-sigCh
 	fmt.Println("\n🛑 Stopping SOCKS5 proxy and WireGuard device...")
+
+	// Force exit immediately if user sends interrupt again
+	go func() {
+		<-sigCh
+		os.Exit(130)
+	}()
+
 	_ = socksServer.Close()
-	wgDevice.Close()
+
+	closeDone := make(chan struct{})
+	go func() {
+		wgDevice.Close()
+		close(closeDone)
+	}()
+
+	select {
+	case <-closeDone:
+	case <-time.After(1500 * time.Millisecond):
+	}
+
 	fmt.Println("✅ Stopped cleanly.")
 }
