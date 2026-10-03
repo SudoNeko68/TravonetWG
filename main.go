@@ -68,6 +68,31 @@ func parseSocksAddr(val string) (string, bool) {
 	return "", false
 }
 
+func isNonLoopbackAddress(addr string) (bool, string) {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	host = strings.TrimSpace(host)
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		return true, fmt.Sprintf("прокси привязан ко всем сетевым интерфейсам (%s)", addr)
+	}
+	if strings.EqualFold(host, "localhost") {
+		return false, ""
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return true, fmt.Sprintf("прокси привязан к внешнему адресу (%s)", addr)
+	}
+	if ip.IsLoopback() {
+		return false, ""
+	}
+	if ip.IsPrivate() {
+		return true, fmt.Sprintf("прокси привязан к локальной сети (%s), доступен другим устройствам в LAN", addr)
+	}
+	return true, fmt.Sprintf("прокси привязан к публичному/внешнему IP (%s), доступен из интернета", addr)
+}
+
 func printUsage() {
 	fmt.Printf(`Usage: %s [OPTIONS] [INTERFACE-NAME]
 
@@ -623,6 +648,15 @@ func runSocks5Userspace(socks5Addr string, parsedConfig *conf.Config, evasionCfg
 	fmt.Println("│   Zero-Root / Pure Userspace Mode (gVisor Netstack)          │")
 	fmt.Println("│                                                              │")
 	fmt.Println("└──────────────────────────────────────────────────────────────┘")
+	if unsafe, reason := isNonLoopbackAddress(socks5Addr); unsafe {
+		fmt.Fprintln(os.Stderr, "════════════════════════════════════════════════════════════════")
+		fmt.Fprintln(os.Stderr, "[!] ВНИМАНИЕ: НЕБЕЗОПАСНАЯ КОНФИГУРАЦИЯ СЕТИ (SECURITY WARNING)!")
+		fmt.Fprintf(os.Stderr, "    %s.\n", reason)
+		fmt.Fprintln(os.Stderr, "    SOCKS5-прокси работает БЕЗ пароля и авторизации.")
+		fmt.Fprintln(os.Stderr, "    Любой узел сети может использовать этот туннель (Open Proxy).")
+		fmt.Fprintln(os.Stderr, "    Для безопасности привязывайте к 127.0.0.1 (только этот ПК).")
+		fmt.Fprintln(os.Stderr, "════════════════════════════════════════════════════════════════")
+	}
 	fmt.Printf("🚀 SOCKS5 Proxy Listening on: %s\n", socks5Addr)
 	fmt.Printf("📜 Evasion Strategy:          %s\n", evasionCfg.Strategy)
 	fmt.Printf("🎯 Fake TTL:                  %d\n", evasionCfg.FakeTTL)

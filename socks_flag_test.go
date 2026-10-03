@@ -49,3 +49,32 @@ func TestParseSocksAddr(t *testing.T) {
 		})
 	}
 }
+
+func TestIsNonLoopbackAddress(t *testing.T) {
+	tests := []struct {
+		addr         string
+		expectUnsafe bool
+	}{
+		{"127.0.0.1:1080", false},
+		{"127.0.0.2:1080", false},
+		{"localhost:1080", false},
+		{"[::1]:1080", false},
+		{"0.0.0.0:1080", true},
+		{":1080", true},
+		{"[::]:1080", true},
+		{"192.168.1.1:1080", true},
+		{"10.0.0.1:1080", true},
+		{"172.20.0.1:1080", true},
+		{"8.8.8.8:1080", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.addr, func(t *testing.T) {
+			unsafe, reason := isNonLoopbackAddress(tt.addr)
+			if unsafe != tt.expectUnsafe {
+				t.Errorf("isNonLoopbackAddress(%q) unsafe = %v, expected %v (reason: %s)",
+					tt.addr, unsafe, tt.expectUnsafe, reason)
+			}
+		})
+	}
+}
