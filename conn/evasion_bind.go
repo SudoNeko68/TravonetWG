@@ -45,7 +45,7 @@ type EvasionConfig struct {
 func DefaultEvasionConfig() EvasionConfig {
 	return EvasionConfig{
 		Enabled:       true,
-		FakeTTL:       3,
+		FakeTTL:       -1, // -1 = auto-detect if endpoint is known, else fallback to 11
 		PreJunkSize:   64,
 		PreJunkBadsum: false,
 		NormalTTL:     64,
@@ -67,12 +67,16 @@ type EvasionBind struct {
 
 // NewEvasionBind wraps any Bind with our L3 early-termination desync engine
 func NewEvasionBind(base Bind, cfg EvasionConfig) *EvasionBind {
-	strat, err := ParseStrategy(cfg.Strategy, cfg.FakeTTL, cfg.NormalTTL)
+	fakeTTL := cfg.FakeTTL
+	if fakeTTL <= 0 {
+		fakeTTL = 11
+	}
+	strat, err := ParseStrategy(cfg.Strategy, fakeTTL, cfg.NormalTTL)
 	if err != nil {
 		if cfg.Debug {
 			log.Printf("[TRAVONET-WG] ⚠️ Invalid strategy '%s': %v (falling back to default)", cfg.Strategy, err)
 		}
-		strat = DefaultStrategy(cfg.FakeTTL, cfg.NormalTTL)
+		strat = DefaultStrategy(fakeTTL, cfg.NormalTTL)
 	}
 	cfg.compiledStrategy = strat
 

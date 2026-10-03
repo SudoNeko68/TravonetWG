@@ -86,11 +86,45 @@ func (s *Strategy) String() string {
 	return strings.Join(parts, " -> ")
 }
 
-// DefaultStrategy creates the standard 5-packet early-termination pipeline:
-// junk(64) -> frag(8) -> frag(80) -> fake_frag(offset=88, len=32, mf=0, ttl=fakeTTL) -> frag(68)
+// DefaultStrategy creates the proven working evasion pipeline (Zapret Fake UDP + IPFrag2):
+// junk(64) -> fake_udp(148, ttl=fakeTTL) -> frag(8) -> frag(148)
 func DefaultStrategy(fakeTTL, normalTTL int) *Strategy {
 	return &Strategy{
-		Raw: "default-5packet",
+		Raw: "junk(64) -> fake_udp(148) -> frag(8) -> frag(148)",
+		Steps: []Step{
+			{
+				Action: ActionJunk,
+				Length: 64,
+				TTL:    normalTTL,
+			},
+			{
+				Action: ActionFakeUDP,
+				Length: WGHandshakeInitiationSize, // 148 bytes (with 0x01 Handshake Initiation type)
+				TTL:    fakeTTL,
+			},
+			{
+				Action: ActionFrag,
+				Offset: 0,
+				Length: UDPHeaderSize, // 8 bytes (UDP header)
+				MF:     true,
+				TTL:    normalTTL,
+			},
+			{
+				Action: ActionFrag,
+				Offset: UDPHeaderSize,             // 8 bytes
+				Length: WGHandshakeInitiationSize, // 148 bytes
+				MF:     false,                     // Real termination for server
+				TTL:    normalTTL,
+			},
+		},
+	}
+}
+
+// FivePacketStrategy creates the experimental 5-packet early-termination pipeline:
+// junk(64) -> frag(8) -> frag(80) -> fake_frag(offset=88, len=32, mf=0, ttl=fakeTTL) -> frag(68)
+func FivePacketStrategy(fakeTTL, normalTTL int) *Strategy {
+	return &Strategy{
+		Raw: "junk(64) -> frag(8) -> frag(80) -> fake_frag(offset=88, len=32, mf=0) -> frag(68)",
 		Steps: []Step{
 			{
 				Action: ActionJunk,
@@ -120,9 +154,9 @@ func DefaultStrategy(fakeTTL, normalTTL int) *Strategy {
 			},
 			{
 				Action: ActionFrag,
-				Offset: UDPHeaderSize + DefaultPart1WGSize,                                       // 88 bytes
+				Offset: UDPHeaderSize + DefaultPart1WGSize,                                                 // 88 bytes
 				Length: (UDPHeaderSize + WGHandshakeInitiationSize) - (UDPHeaderSize + DefaultPart1WGSize), // 68 bytes
-				MF:     false,                                                                    // Real termination for server
+				MF:     false,                                                                              // Real termination for server
 				TTL:    normalTTL,
 			},
 		},
@@ -134,6 +168,9 @@ func ParseStrategy(dsl string, defaultFakeTTL, defaultNormalTTL int) (*Strategy,
 	clean := strings.TrimSpace(dsl)
 	if clean == "" || strings.EqualFold(clean, "default") {
 		return DefaultStrategy(defaultFakeTTL, defaultNormalTTL), nil
+	}
+	if strings.EqualFold(clean, "5packet") || strings.EqualFold(clean, "early-term") {
+		return FivePacketStrategy(defaultFakeTTL, defaultNormalTTL), nil
 	}
 
 	// Delimiters can be "->" or ";" or newlines
