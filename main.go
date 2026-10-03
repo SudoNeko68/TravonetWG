@@ -8,14 +8,17 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
 
 	"golang.org/x/sys/unix"
+	"golang.zx2c4.com/wireguard/conf"
 	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/device"
 	"golang.zx2c4.com/wireguard/ipc"
@@ -34,7 +37,7 @@ const (
 )
 
 func printUsage() {
-	fmt.Printf("Usage: %s [-f/--foreground] [-d/--debug] [--strategy \"...\"] [--fake-ttl N] [--pre-junk N] [--no-evasion] INTERFACE-NAME\n", os.Args[0])
+	fmt.Printf("Usage: %s [-f/--foreground] [-d/--debug] [-c/--config CONFIG_FILE] [--strategy \"...\"] [--fake-ttl N] [--pre-junk N] [--no-evasion] [INTERFACE-NAME]\n", os.Args[0])
 }
 
 func warning() {
@@ -65,6 +68,7 @@ func main() {
 
 	var foreground bool
 	var debug bool
+	var configFile string
 	var interfaceName string
 	evasionCfg := conn.DefaultEvasionConfig()
 
@@ -91,6 +95,11 @@ func main() {
 			debug = true
 		case "--no-evasion":
 			evasionCfg.Enabled = false
+		case "-c", "--config", "-config":
+			if i+1 < len(os.Args) {
+				i++
+				configFile = os.Args[i]
+			}
 		case "-s", "--strategy", "-strategy":
 			if i+1 < len(os.Args) {
 				i++
@@ -116,6 +125,35 @@ func main() {
 				return
 			}
 			interfaceName = arg
+		}
+	}
+
+	var parsedConfig *conf.Config
+	if configFile != "" {
+		cfg, err := conf.ParseConfigFile(configFile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error parsing config file %s: %v\n", configFile, err)
+			os.Exit(ExitSetupFailed)
+			return
+		}
+		parsedConfig = cfg
+
+		// If interface name not provided, derive from filename
+		if interfaceName == "" {
+			base := filepath.Base(configFile)
+			ext := filepath.Ext(base)
+			interfaceName = strings.TrimSuffix(base, ext)
+		}
+
+		// Apply evasion overrides from config file
+		if cfg.Strategy != "" && evasionCfg.Strategy == "default" {
+			evasionCfg.Strategy = cfg.Strategy
+		}
+		if cfg.FakeTTL > 0 {
+			evasionCfg.FakeTTL = cfg.FakeTTL
+		}
+		if cfg.PreJunkSize > 0 {
+			evasionCfg.PreJunkSize = cfg.PreJunkSize
 		}
 	}
 
@@ -268,6 +306,29 @@ func main() {
 
 	bind := conn.NewEvasionBind(conn.NewDefaultBind(), evasionCfg)
 	device := device.NewDevice(tdev, bind, logger)
+
+	if parsedConfig != nil {
+		uapiStr, err := parsedConfig.ToUAPI()
+		if err != nil {
+			logger.Errorf("Failed to build UAPI config: %v", err)
+			os.Exit(ExitSetupFailed)
+			return
+		}
+
+		if err := device.IpcSetOperation(bufio.NewReader(strings.NewReader(uapiStr))); err != nil {
+			logger.Errorf("Failed to apply UAPI configuration: %v", err)
+			os.Exit(ExitSetupFailed)
+			return
+		}
+
+		if err := parsedConfig.ApplyNetworkConfig(interfaceName); err != nil {
+			logger.Errorf("Failed to configure network interface %s: %v", interfaceName, err)
+			os.Exit(ExitSetupFailed)
+			return
+		}
+
+		logger.Verbosef("✅ WireGuard configuration from %s applied successfully to %s", configFile, interfaceName)
+	}
 
 	logger.Verbosef("Device started")
 
