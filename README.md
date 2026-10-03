@@ -7,7 +7,7 @@
 **TravonetWG** is an advanced in-client L3 evasion fork of [`wireguard-go`](https://git.zx2c4.com/wireguard-go). It bypasses deep packet inspection (TSPU / DPI) in restrictive network environments without requiring any server-side changes, special patches, or non-standard protocols.
 ---
 
-## 🛠️ How It Works: The Proven Evasion Pipeline
+##  How It Works: The Proven Evasion Pipeline
 
 During a standard WireGuard connection, the client sends a distinct 148-byte UDP packet (`0x01` handshake initiation). TSPU boxes detect the 148-byte length on UDP ports and block the flow.
 
@@ -29,7 +29,7 @@ TravonetWG intercepts handshake initiation packets at the raw socket level and e
 
 ---
 
-## ⚙️ Dual Configuration Modes
+##  Dual Configuration Modes
 
 TravonetWG provides two distinct modes depending on your preference:
 
@@ -103,7 +103,7 @@ sudo ./travonet-wg -f -c clean-warp.conf --no-evasion warp
 
 ---
 
-## 📏 Auto-TTL Hop Distance Probe
+##  Auto-TTL Hop Distance Probe
 
 Because TSPU DPI hardware is located within domestic transit/backbone networks (typically hops 8–11 in Russia), fake packets must have a TTL large enough to traverse TSPU, but small enough to expire before reaching the foreign server.
 
@@ -114,7 +114,7 @@ TravonetWG includes a built-in traceroute engine (`conn.MeasureTargetTTL`) that:
 
 ---
 
-## 📜 Strategy DSL Syntax
+##  Strategy DSL Syntax
 
 TravonetWG features a domain-specific language (DSL) to customize packet sequences:
 
@@ -128,7 +128,7 @@ TravonetWG features a domain-specific language (DSL) to customize packet sequenc
 
 ---
 
-## 🚀 Building & Running
+##  Building & Running
 
 ### Prerequisites
 - Linux with Go 1.22+ installed
@@ -162,5 +162,5 @@ curl https://cloudflare.com/cdn-cgi/trace
 
 ---
 
-## 📄 License
-MIT License. Copyright (C) 2017-2025 WireGuard LLC. Copyright (C) 2026 TravonetWG Contributors.
+## License
+MIT License. Copyright (C) 2017-2025 WireGuard LLC. Copyright (C) 2026 Travonet.
