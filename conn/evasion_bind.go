@@ -67,7 +67,6 @@ type EvasionBind struct {
 
 // NewEvasionBind wraps any Bind with our L3 early-termination desync engine
 func NewEvasionBind(base Bind, cfg EvasionConfig) *EvasionBind {
-	// Compile the strategy pipeline
 	strat, err := ParseStrategy(cfg.Strategy, cfg.FakeTTL, cfg.NormalTTL)
 	if err != nil {
 		if cfg.Debug {
@@ -84,18 +83,11 @@ func NewEvasionBind(base Bind, cfg EvasionConfig) *EvasionBind {
 	}
 
 	if cfg.Enabled {
-		rawFd, err := initRawSocket()
-		if err != nil {
-			if cfg.Debug {
-				fmt.Printf("DEBUG: (evasion) [TRAVONET-WG] ⚠️ Notice: Raw socket initialization failed: %v (requires root/CAP_NET_RAW)\n", err)
-				fmt.Printf("DEBUG: (evasion) [TRAVONET-WG] ⚠️ L3 evasion will be skipped unless granted CAP_NET_RAW\n")
-			}
-		} else {
-			b.rawFd = rawFd
-			if cfg.Debug {
-				fmt.Printf("DEBUG: (evasion) [TRAVONET-WG] 🛡️ L3 Evasion Raw Socket initialized (IP_NODEFRAG=1, IP_HDRINCL=1)\n")
-				fmt.Printf("DEBUG: (evasion) [TRAVONET-WG] 📜 Active Evasion Strategy: %s\n", strat.String())
-			}
+		b.mu.Lock()
+		_, _ = b.ensureRawSocketLocked()
+		b.mu.Unlock()
+		if cfg.Debug {
+			fmt.Printf("DEBUG: (evasion) [TRAVONET-WG] 📜 Active Evasion Strategy: %s\n", strat.String())
 		}
 	}
 
@@ -105,15 +97,37 @@ func NewEvasionBind(base Bind, cfg EvasionConfig) *EvasionBind {
 func initRawSocket() (int, error) {
 	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_RAW)
 	if err != nil {
-		return -1, err
+		return -1, fmt.Errorf("syscall.Socket(AF_INET, SOCK_RAW, IPPROTO_RAW): %w", err)
 	}
 	if err := syscall.SetsockoptInt(fd, syscall.IPPROTO_IP, syscall.IP_HDRINCL, 1); err != nil {
 		syscall.Close(fd)
 		return -1, fmt.Errorf("setsockopt IP_HDRINCL: %w", err)
 	}
-	if err := syscall.SetsockoptInt(fd, syscall.IPPROTO_IP, IP_NODEFRAG, 1); err != nil {
-		syscall.Close(fd)
-		return -1, fmt.Errorf("setsockopt IP_NODEFRAG: %w", err)
+	// IP_NODEFRAG tells kernel not to reassemble fragments on outgoing raw socket.
+	// We ignore errors here in case specific kernels or container namespaces don't permit it.
+	_ = syscall.SetsockoptInt(fd, syscall.IPPROTO_IP, IP_NODEFRAG, 1)
+
+	// IP_FREEBIND (15) allows binding/sending with non-local source addresses if needed.
+	_ = syscall.SetsockoptInt(fd, syscall.IPPROTO_IP, 15, 1)
+
+	return fd, nil
+}
+
+func (b *EvasionBind) ensureRawSocketLocked() (int, error) {
+	if b.rawFd >= 0 {
+		return b.rawFd, nil
+	}
+	fd, err := initRawSocket()
+	if err != nil {
+		if b.cfg.Debug {
+			fmt.Printf("DEBUG: (evasion) [TRAVONET-WG] ⚠️ Notice: Raw socket initialization failed: %v (requires root/CAP_NET_RAW)\n", err)
+			fmt.Printf("DEBUG: (evasion) [TRAVONET-WG] ⚠️ L3 evasion will be skipped unless granted CAP_NET_RAW\n")
+		}
+		return -1, err
+	}
+	b.rawFd = fd
+	if b.cfg.Debug {
+		fmt.Printf("DEBUG: (evasion) [TRAVONET-WG] 🛡️ L3 Evasion Raw Socket initialized (fd=%d, IP_NODEFRAG=1, IP_HDRINCL=1)\n", fd)
 	}
 	return fd, nil
 }
@@ -126,10 +140,14 @@ func (b *EvasionBind) Open(port uint16) ([]ReceiveFunc, uint16, error) {
 
 	b.mu.Lock()
 	b.actualPort = actualPort
+	b.closed = false
+	if b.cfg.Enabled {
+		_, _ = b.ensureRawSocketLocked()
+	}
 	b.mu.Unlock()
 
 	if b.cfg.Debug {
-		log.Printf("[TRAVONET-WG] 🔌 Socket bound to local port %d", actualPort)
+		fmt.Printf("DEBUG: (evasion) [TRAVONET-WG] 🔌 Socket bound to local port %d\n", actualPort)
 	}
 
 	// Wrap each ReceiveFunc to monitor incoming packets in debug mode
@@ -178,10 +196,13 @@ func (b *EvasionBind) Close() error {
 }
 
 func (b *EvasionBind) Send(bufs [][]byte, ep Endpoint) error {
-	b.mu.RLock()
+	b.mu.Lock()
+	if b.cfg.Enabled && b.rawFd < 0 {
+		_, _ = b.ensureRawSocketLocked()
+	}
 	rawFd := b.rawFd
 	actualPort := b.actualPort
-	b.mu.RUnlock()
+	b.mu.Unlock()
 
 	// If raw socket is not available or evasion disabled, standard send
 	if !b.cfg.Enabled || rawFd < 0 || ep.DstIP().Is6() {
@@ -238,9 +259,11 @@ func (b *EvasionBind) sendObfuscatedHandshake(rawFd int, localPort int, ep Endpo
 		srcIP = net.IP(ep.SrcIP().AsSlice()).To4()
 	}
 	if srcIP == nil {
-		conn, err := net.Dial("udp", ep.DstToString())
+		conn, err := net.Dial("udp4", ep.DstToString())
 		if err == nil {
-			srcIP = conn.LocalAddr().(*net.UDPAddr).IP.To4()
+			if udpAddr, ok := conn.LocalAddr().(*net.UDPAddr); ok {
+				srcIP = udpAddr.IP.To4()
+			}
 			conn.Close()
 		}
 	}
@@ -250,6 +273,11 @@ func (b *EvasionBind) sendObfuscatedHandshake(rawFd int, localPort int, ep Endpo
 
 	srcPort := localPort
 	if srcPort == 0 {
+		b.mu.RLock()
+		srcPort = int(b.actualPort)
+		b.mu.RUnlock()
+	}
+	if srcPort == 0 {
 		srcPort = 51820
 	}
 
@@ -257,6 +285,11 @@ func (b *EvasionBind) sendObfuscatedHandshake(rawFd int, localPort int, ep Endpo
 	var ipIDBuf [2]byte
 	rand.Read(ipIDBuf[:])
 	ipID := binary.BigEndian.Uint16(ipIDBuf[:])
+
+	if b.cfg.Debug {
+		fmt.Printf("DEBUG: (evasion) [TRAVONET-WG] 🛰️ Flow: %s:%d -> %s:%d (IP ID: 0x%04x)\n",
+			srcIP.String(), srcPort, dstAddrPort.Addr().String(), dstPort, ipID)
+	}
 
 	// Build UDP header with full length (8 + 148 = 156) and computed checksum
 	fullUDPDatagramLen := UDPHeaderSize + len(wgPayload)
@@ -309,6 +342,10 @@ func (b *EvasionBind) sendObfuscatedHandshake(rawFd int, localPort int, ep Endpo
 			if err := sendRawPacket(rawFd, dstIP, junkPkt); err != nil {
 				return fmt.Errorf("step %d (junk) send: %w", i+1, err)
 			}
+			if b.cfg.Debug {
+				fmt.Printf("DEBUG: (evasion) [TRAVONET-WG]   [%d/%d] 📦 Sent Pre-Junk UDP packet (%d bytes payload, TTL=%d, Badsum=%v)\n",
+					i+1, len(strategy.Steps), len(junkPayload), ttl, step.Badsum)
+			}
 
 		case ActionFrag:
 			offset := step.Offset
@@ -338,6 +375,10 @@ func (b *EvasionBind) sendObfuscatedHandshake(rawFd int, localPort int, ep Endpo
 			if err := sendRawPacket(rawFd, dstIP, fragPkt); err != nil {
 				return fmt.Errorf("step %d (frag) send: %w", i+1, err)
 			}
+			if b.cfg.Debug {
+				fmt.Printf("DEBUG: (evasion) [TRAVONET-WG]   [%d/%d] 🧩 Sent Frag (offset=%d, len=%d, MF=%v, TTL=%d)\n",
+					i+1, len(strategy.Steps), offset, length, mf, ttl)
+			}
 			currentOffset = offset + length
 
 		case ActionFakeFrag:
@@ -356,6 +397,10 @@ func (b *EvasionBind) sendObfuscatedHandshake(rawFd int, localPort int, ep Endpo
 			fakePkt := buildIPv4Packet(srcIP, dstIP, ipID, ttl, step.MF, offset, fakePayload)
 			if err := sendRawPacket(rawFd, dstIP, fakePkt); err != nil {
 				return fmt.Errorf("step %d (fake_frag) send: %w", i+1, err)
+			}
+			if b.cfg.Debug {
+				fmt.Printf("DEBUG: (evasion) [TRAVONET-WG]   [%d/%d] ☠️ Sent FAKE Frag (offset=%d, len=%d, MF=%v, TTL=%d) [DPI Early-Termination]\n",
+					i+1, len(strategy.Steps), offset, len(fakePayload), step.MF, ttl)
 			}
 
 		case ActionFakeUDP:
@@ -387,9 +432,16 @@ func (b *EvasionBind) sendObfuscatedHandshake(rawFd int, localPort int, ep Endpo
 			if err := sendRawPacket(rawFd, dstIP, pkt); err != nil {
 				return fmt.Errorf("step %d (fake_udp) send: %w", i+1, err)
 			}
+			if b.cfg.Debug {
+				fmt.Printf("DEBUG: (evasion) [TRAVONET-WG]   [%d/%d] 🎭 Sent FAKE UDP packet (%d bytes payload, TTL=%d, Badsum=%v)\n",
+					i+1, len(strategy.Steps), len(fakePayload), ttl, step.Badsum)
+			}
 
 		case ActionSleep:
 			if step.SleepDur > 0 {
+				if b.cfg.Debug {
+					fmt.Printf("DEBUG: (evasion) [TRAVONET-WG]   [%d/%d] ⏱️ Sleeping %v\n", i+1, len(strategy.Steps), step.SleepDur)
+				}
 				time.Sleep(step.SleepDur)
 			}
 		}
@@ -399,10 +451,12 @@ func (b *EvasionBind) sendObfuscatedHandshake(rawFd int, localPort int, ep Endpo
 }
 
 func sendRawPacket(rawFd int, dstIP []byte, packet []byte) error {
-	addr := syscall.SockaddrInet4{
-		Port: 0,
+	var addr syscall.SockaddrInet4
+	if len(dstIP) >= 4 {
+		copy(addr.Addr[:], dstIP[:4])
+	} else {
+		return fmt.Errorf("invalid IPv4 address length: %d", len(dstIP))
 	}
-	copy(addr.Addr[:], dstIP[:4])
 	return syscall.Sendto(rawFd, packet, 0, &addr)
 }
 
