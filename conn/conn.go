@@ -71,6 +71,12 @@ type PeekLookAtSocketFd interface {
 	PeekLookAtSocketFd6() (fd int, err error)
 }
 
+// SocketTTLController is implemented by Bind objects that support changing
+// socket TTL at runtime for unprivileged userspace desync.
+type SocketTTLController interface {
+	SetIPv4TTL(ttl int) error
+}
+
 // An Endpoint maintains the source/destination caching for a peer.
 //
 //	dst: the remote address of a peer ("endpoint" in uapi terminology)

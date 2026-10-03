@@ -81,3 +81,91 @@ func TestComputeUDPChecksum(t *testing.T) {
 		t.Logf("UDP checksum computed: 0x%04x, verify: 0x%04x", csum, verifySum)
 	}
 }
+
+type mockUserspaceBind struct {
+	Bind
+	sentPackets [][]byte
+	ttlHistory  []int
+	currentTTL  int
+}
+
+func (m *mockUserspaceBind) Send(bufs [][]byte, ep Endpoint) error {
+	for _, b := range bufs {
+		cp := make([]byte, len(b))
+		copy(cp, b)
+		m.sentPackets = append(m.sentPackets, cp)
+	}
+	return nil
+}
+
+func (m *mockUserspaceBind) SetIPv4TTL(ttl int) error {
+	m.currentTTL = ttl
+	m.ttlHistory = append(m.ttlHistory, ttl)
+	return nil
+}
+
+func TestUserspaceEvasionSend(t *testing.T) {
+	mock := &mockUserspaceBind{}
+	cfg := DefaultEvasionConfig()
+	cfg.FakeTTL = 9
+	cfg.NormalTTL = 64
+	cfg.Strategy = "junk(64) -> fake_udp(148, ttl=9) -> frag(8) -> frag(148)"
+	cfg.Debug = true
+
+	b := NewEvasionBind(mock, cfg)
+	// Force rawFd = -1 to simulate unprivileged userspace (non-root / Android)
+	b.rawFd = -1
+
+	ep := &StdNetEndpoint{}
+	handshake := make([]byte, WGHandshakeInitiationSize)
+	handshake[0] = 0x01
+	for i := 4; i < len(handshake); i++ {
+		handshake[i] = byte(i)
+	}
+
+	err := b.sendUserspaceObfuscatedHandshake(ep, handshake)
+	if err != nil {
+		t.Fatalf("sendUserspaceObfuscatedHandshake failed: %v", err)
+	}
+
+	// In userspace mode:
+	// Step 1: Junk (64 bytes)
+	// Step 2: Fake UDP (148 bytes, with TTL set to 9, then restored to 64)
+	// Step 3: Real Handshake (148 bytes, with TTL 64)
+	if len(mock.sentPackets) != 3 {
+		t.Fatalf("expected 3 packets sent in userspace mode, got %d", len(mock.sentPackets))
+	}
+
+	// 1. Check Junk
+	if len(mock.sentPackets[0]) != 64 {
+		t.Errorf("expected packet 0 (junk) len 64, got %d", len(mock.sentPackets[0]))
+	}
+
+	// 2. Check Fake UDP
+	if len(mock.sentPackets[1]) != 148 {
+		t.Errorf("expected packet 1 (fake_udp) len 148, got %d", len(mock.sentPackets[1]))
+	}
+	if mock.sentPackets[1][0] != 0x01 {
+		t.Errorf("expected packet 1 (fake_udp) type 0x01, got 0x%02x", mock.sentPackets[1][0])
+	}
+
+	// 3. Check Real Handshake
+	if len(mock.sentPackets[2]) != 148 {
+		t.Errorf("expected packet 2 (real handshake) len 148, got %d", len(mock.sentPackets[2]))
+	}
+	if mock.sentPackets[2][4] != 4 || mock.sentPackets[2][10] != 10 {
+		t.Errorf("real handshake payload mismatch")
+	}
+
+	// 4. Verify TTL manipulation sequence:
+	// Set to FakeTTL (9), then restored to NormalTTL (64), and final guarantee 64
+	if len(mock.ttlHistory) < 2 {
+		t.Fatalf("expected at least 2 TTL adjustments, got %d: %+v", len(mock.ttlHistory), mock.ttlHistory)
+	}
+	if mock.ttlHistory[0] != 9 {
+		t.Errorf("expected initial TTL change to fakeTTL 9, got %d", mock.ttlHistory[0])
+	}
+	if mock.ttlHistory[len(mock.ttlHistory)-1] != 64 {
+		t.Errorf("expected final TTL to be restored to 64, got %d", mock.ttlHistory[len(mock.ttlHistory)-1])
+	}
+}

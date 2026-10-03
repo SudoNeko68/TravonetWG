@@ -9,6 +9,7 @@ package conn
 import (
 	"crypto/rand"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -63,6 +64,42 @@ type EvasionBind struct {
 	rawFd      int
 	actualPort uint16
 	closed     bool
+}
+
+var (
+	_ Bind                = (*EvasionBind)(nil)
+	_ PeekLookAtSocketFd  = (*EvasionBind)(nil)
+	_ SocketTTLController = (*EvasionBind)(nil)
+)
+
+// PeekLookAtSocketFd4 forwards to the underlying bind if supported.
+// Crucial for Android VpnService.protect(socket).
+func (b *EvasionBind) PeekLookAtSocketFd4() (int, error) {
+	if peeker, ok := b.Bind.(PeekLookAtSocketFd); ok {
+		return peeker.PeekLookAtSocketFd4()
+	}
+	return -1, errors.New("underlying bind does not implement PeekLookAtSocketFd")
+}
+
+// PeekLookAtSocketFd6 forwards to the underlying bind if supported.
+func (b *EvasionBind) PeekLookAtSocketFd6() (int, error) {
+	if peeker, ok := b.Bind.(PeekLookAtSocketFd); ok {
+		return peeker.PeekLookAtSocketFd6()
+	}
+	return -1, errors.New("underlying bind does not implement PeekLookAtSocketFd")
+}
+
+// SetIPv4TTL sets the IP_TTL on the underlying socket for userspace evasion.
+func (b *EvasionBind) SetIPv4TTL(ttl int) error {
+	if ctrl, ok := b.Bind.(SocketTTLController); ok {
+		return ctrl.SetIPv4TTL(ttl)
+	}
+	if peeker, ok := b.Bind.(PeekLookAtSocketFd); ok {
+		if fd, err := peeker.PeekLookAtSocketFd4(); err == nil && fd >= 0 {
+			return syscall.SetsockoptInt(fd, syscall.IPPROTO_IP, syscall.IP_TTL, ttl)
+		}
+	}
+	return errors.New("underlying bind does not support setting TTL")
 }
 
 // NewEvasionBind wraps any Bind with our L3 early-termination desync engine
@@ -124,14 +161,14 @@ func (b *EvasionBind) ensureRawSocketLocked() (int, error) {
 	fd, err := initRawSocket()
 	if err != nil {
 		if b.cfg.Debug {
-			fmt.Printf("DEBUG: (evasion) [TRAVONET-WG] ⚠️ Notice: Raw socket initialization failed: %v (requires root/CAP_NET_RAW)\n", err)
-			fmt.Printf("DEBUG: (evasion) [TRAVONET-WG] ⚠️ L3 evasion will be skipped unless granted CAP_NET_RAW\n")
+			fmt.Printf("DEBUG: (evasion) [TRAVONET-WG] ℹ️ Unprivileged userspace environment detected (raw socket: %v)\n", err)
+			fmt.Printf("DEBUG: (evasion) [TRAVONET-WG] 🛡️ Activating Userspace UDP Desync Engine (IP_TTL + Pre-Junk without root)\n")
 		}
 		return -1, err
 	}
 	b.rawFd = fd
 	if b.cfg.Debug {
-		fmt.Printf("DEBUG: (evasion) [TRAVONET-WG] 🛡️ L3 Evasion Raw Socket initialized (fd=%d, IP_NODEFRAG=1, IP_HDRINCL=1)\n", fd)
+		fmt.Printf("DEBUG: (evasion) [TRAVONET-WG] 🛡️ Privileged L3 Evasion Raw Socket initialized (fd=%d, IP_NODEFRAG=1, IP_HDRINCL=1)\n", fd)
 	}
 	return fd, nil
 }
@@ -208,11 +245,8 @@ func (b *EvasionBind) Send(bufs [][]byte, ep Endpoint) error {
 	actualPort := b.actualPort
 	b.mu.Unlock()
 
-	// If raw socket is not available or evasion disabled, standard send
-	if !b.cfg.Enabled || rawFd < 0 || ep.DstIP().Is6() {
-		if b.cfg.Debug && len(bufs) > 0 && len(bufs[0]) == WGHandshakeInitiationSize && bufs[0][0] == 0x01 {
-			fmt.Printf("DEBUG: (evasion) [TRAVONET-WG] ⚠️ Evasion skipped (enabled=%v, rawFd=%d, isIPv6=%v), sending standard packet\n", b.cfg.Enabled, rawFd, ep.DstIP().Is6())
-		}
+	// If evasion disabled or IPv6 endpoint, standard send
+	if !b.cfg.Enabled || ep.DstIP().Is6() {
 		return b.Bind.Send(bufs, ep)
 	}
 
@@ -224,7 +258,15 @@ func (b *EvasionBind) Send(bufs [][]byte, ep Endpoint) error {
 				fmt.Printf("DEBUG: (evasion) [TRAVONET-WG] 🚀 >>> Handshake Initiation detected (148 bytes) to %s\n", ep.DstToString())
 			}
 
-			err := b.sendObfuscatedHandshake(rawFd, int(actualPort), ep, buf)
+			var err error
+			if rawFd >= 0 {
+				// Mode 1: Privileged L3 Raw Socket Evasion (IPFrag2 + Fake UDP/Frag + Junk)
+				err = b.sendObfuscatedHandshake(rawFd, int(actualPort), ep, buf)
+			} else {
+				// Mode 2: Unprivileged Userspace UDP Desync (UDP Fake TTL + Pre-Junk + Timing)
+				err = b.sendUserspaceObfuscatedHandshake(ep, buf)
+			}
+
 			if err != nil {
 				if b.cfg.Debug {
 					fmt.Printf("DEBUG: (evasion) [TRAVONET-WG] ❌ Evasion send failed: %v (falling back to standard send)\n", err)
@@ -232,7 +274,7 @@ func (b *EvasionBind) Send(bufs [][]byte, ep Endpoint) error {
 				standardBufs = append(standardBufs, buf)
 			} else {
 				if b.cfg.Debug {
-					fmt.Printf("DEBUG: (evasion) [TRAVONET-WG] ✅ 5-packet evasion sequence sent successfully to %s!\n", ep.DstToString())
+					fmt.Printf("DEBUG: (evasion) [TRAVONET-WG] ✅ Evasion sequence sent successfully to %s!\n", ep.DstToString())
 				}
 			}
 		} else {
@@ -244,6 +286,100 @@ func (b *EvasionBind) Send(bufs [][]byte, ep Endpoint) error {
 	if len(standardBufs) > 0 {
 		return b.Bind.Send(standardBufs, ep)
 	}
+	return nil
+}
+
+// sendUserspaceObfuscatedHandshake executes userspace UDP evasion without root privileges:
+// 1. Sends pre-junk UDP packets from the active WireGuard UDP socket.
+// 2. Temporarily sets IP_TTL on the UDP socket to fakeTTL.
+// 3. Transmits 148-byte fake Handshake Initiation (with 0x01 header) to poison TSPU state table.
+// 4. Restores normal IP_TTL (64).
+// 5. Handles timing sleeps if requested by the DSL.
+// 6. Transmits the legitimate 148-byte WireGuard Handshake Initiation.
+func (b *EvasionBind) sendUserspaceObfuscatedHandshake(ep Endpoint, wgPayload []byte) error {
+	strategy := b.cfg.compiledStrategy
+	if strategy == nil || len(strategy.Steps) == 0 {
+		return b.Bind.Send([][]byte{wgPayload}, ep)
+	}
+
+	if b.cfg.Debug {
+		fmt.Printf("DEBUG: (evasion) [TRAVONET-WG] 🛡️ Executing Userspace UDP Desync (%d steps) to %s\n",
+			len(strategy.Steps), ep.DstToString())
+	}
+
+	for i, step := range strategy.Steps {
+		switch step.Action {
+		case ActionJunk:
+			junkPayload := make([]byte, step.Length)
+			rand.Read(junkPayload)
+			if err := b.Bind.Send([][]byte{junkPayload}, ep); err != nil {
+				if b.cfg.Debug {
+					fmt.Printf("DEBUG: (evasion) [TRAVONET-WG]   [%d/%d] ⚠️ Userspace junk send error: %v\n", i+1, len(strategy.Steps), err)
+				}
+			} else if b.cfg.Debug {
+				fmt.Printf("DEBUG: (evasion) [TRAVONET-WG]   [%d/%d] 📦 Sent Userspace Pre-Junk UDP packet (%d bytes)\n",
+					i+1, len(strategy.Steps), step.Length)
+			}
+
+		case ActionFakeUDP:
+			fakePayload := make([]byte, step.Length)
+			rand.Read(fakePayload)
+			if step.Length == WGHandshakeInitiationSize {
+				fakePayload[0] = 0x01 // Valid WireGuard initiation byte for DPI
+				fakePayload[1] = 0x00
+				fakePayload[2] = 0x00
+				fakePayload[3] = 0x00
+			}
+
+			ttl := step.TTL
+			if ttl <= 0 {
+				ttl = b.cfg.FakeTTL
+			}
+			if ttl <= 0 {
+				ttl = 11
+			}
+
+			// 1. Temporarily drop socket TTL to fakeTTL
+			if err := b.SetIPv4TTL(ttl); err != nil && b.cfg.Debug {
+				fmt.Printf("DEBUG: (evasion) [TRAVONET-WG]   [%d/%d] ⚠️ Failed to set fake TTL: %v\n", i+1, len(strategy.Steps), err)
+			}
+
+			// 2. Transmit fake packet from the exact same UDP socket
+			_ = b.Bind.Send([][]byte{fakePayload}, ep)
+
+			// 3. Immediately restore socket TTL to normal
+			_ = b.SetIPv4TTL(b.cfg.NormalTTL)
+
+			if b.cfg.Debug {
+				fmt.Printf("DEBUG: (evasion) [TRAVONET-WG]   [%d/%d] 🎭 Sent Userspace FAKE UDP packet (%d bytes, TTL=%d) [DPI Desync]\n",
+					i+1, len(strategy.Steps), len(fakePayload), ttl)
+			}
+
+		case ActionSleep:
+			if step.SleepDur > 0 {
+				if b.cfg.Debug {
+					fmt.Printf("DEBUG: (evasion) [TRAVONET-WG]   [%d/%d] ⏱️ Sleeping %v\n", i+1, len(strategy.Steps), step.SleepDur)
+				}
+				time.Sleep(step.SleepDur)
+			}
+
+		case ActionFrag, ActionFakeFrag:
+			// In userspace mode without raw sockets, transport headers cannot be split from payload.
+			// Handled by sending the full legitimate payload at the end of the sequence.
+		}
+	}
+
+	// Finally, send the legitimate WireGuard Handshake Initiation packet with normal TTL!
+	_ = b.SetIPv4TTL(b.cfg.NormalTTL)
+	if err := b.Bind.Send([][]byte{wgPayload}, ep); err != nil {
+		return fmt.Errorf("legitimate handshake send failed: %w", err)
+	}
+
+	if b.cfg.Debug {
+		fmt.Printf("DEBUG: (evasion) [TRAVONET-WG] 🚀 Sent Legitimate WireGuard Handshake (148 bytes, TTL=%d) to %s\n",
+			b.cfg.NormalTTL, ep.DstToString())
+	}
+
 	return nil
 }
 
