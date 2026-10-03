@@ -406,6 +406,9 @@ func (b *EvasionBind) sendObfuscatedHandshake(rawFd int, localPort int, ep Endpo
 		case ActionFakeUDP:
 			fakePayload := make([]byte, step.Length)
 			rand.Read(fakePayload)
+			if step.Length == WGHandshakeInitiationSize {
+				fakePayload[0] = 0x01 // Valid WireGuard Handshake Initiation Type for DPI
+			}
 
 			fakeUDPHeader := make([]byte, UDPHeaderSize)
 			binary.BigEndian.PutUint16(fakeUDPHeader[0:2], uint16(srcPort))
