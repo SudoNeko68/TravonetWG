@@ -41,6 +41,33 @@ const (
 	ENV_WG_PROCESS_FOREGROUND = "WG_PROCESS_FOREGROUND"
 )
 
+func parseSocksAddr(val string) (string, bool) {
+	val = strings.TrimSpace(val)
+	if val == "" {
+		return "127.0.0.1:1080", true
+	}
+	// Pure port number: "1080" -> "127.0.0.1:1080"
+	if p, err := strconv.Atoi(val); err == nil && p > 0 && p <= 65535 {
+		return fmt.Sprintf("127.0.0.1:%d", p), true
+	}
+	// Port with colon: ":1080" -> "127.0.0.1:1080"
+	if strings.HasPrefix(val, ":") {
+		if p, err := strconv.Atoi(val[1:]); err == nil && p > 0 && p <= 65535 {
+			return fmt.Sprintf("127.0.0.1:%d", p), true
+		}
+	}
+	// "host:port" or "ip:port"
+	if host, port, err := net.SplitHostPort(val); err == nil {
+		if p, err := strconv.Atoi(port); err == nil && p > 0 && p <= 65535 {
+			if host == "" {
+				return fmt.Sprintf("127.0.0.1:%d", p), true
+			}
+			return val, true
+		}
+	}
+	return "", false
+}
+
 func printUsage() {
 	fmt.Printf(`Usage: %s [OPTIONS] [INTERFACE-NAME]
 
@@ -64,20 +91,22 @@ Modes:
 
   Mode 3 (Zero-Root Userspace SOCKS5 Inbound):
       Run pure userspace SOCKS5 proxy without root, TUN device, or routing changes:
-          %s -c wg0.conf --socks5 127.0.0.1:1080
+          %s -c wg0.conf --socks
+          %s -c wg0.conf --socks 127.0.0.1:1080
+          %s -c wg0.conf --socks 1080
 
 Options:
-  -c, --config FILE       Load WireGuard configuration file (.conf)
-  --socks5 [ADDR]         Start userspace SOCKS5 proxy (default: 127.0.0.1:1080)
-  -s, --strategy DSL      Evasion pipeline DSL (default: "junk(64) -> fake_udp(148) -> frag(8) -> frag(148)")
-  --fake-ttl N|auto       TTL for fake packets (number 1-255 or 'auto' for hop distance probe)
-  --pre-junk N            Size in bytes of initial junk UDP packet (default: 64, 0 to disable)
-  --no-evasion            Disable all evasion mechanisms (run as standard wireguard-go)
-  -d, --debug             Enable verbose debug logging
-  -f, --foreground        Run in foreground instead of daemonizing
-  -h, --help              Show this help message
-  --version               Show version information
-`, os.Args[0], os.Args[0], os.Args[0], os.Args[0])
+  -c, --config FILE             Load WireGuard configuration file (.conf)
+  --socks, --socks5 [ADDR:PORT] Start userspace SOCKS5 proxy (default: 127.0.0.1:1080)
+  -s, --strategy DSL            Evasion pipeline DSL (default: "junk(64) -> fake_udp(148) -> frag(8) -> frag(148)")
+  --fake-ttl N|auto             TTL for fake packets (number 1-255 or 'auto' for hop distance probe)
+  --pre-junk N                  Size in bytes of initial junk UDP packet (default: 64, 0 to disable)
+  --no-evasion                  Disable all evasion mechanisms (run as standard wireguard-go)
+  -d, --debug                   Enable verbose debug logging
+  -f, --foreground              Run in foreground instead of daemonizing
+  -h, --help                    Show this help message
+  --version                     Show version information
+`, os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0])
 }
 
 func warning() {
@@ -151,8 +180,10 @@ func main() {
 		case "--socks5", "-socks5", "--socks", "-socks":
 			cliSocks5 = "127.0.0.1:1080"
 			if i+1 < len(os.Args) && !strings.HasPrefix(os.Args[i+1], "-") {
-				i++
-				cliSocks5 = os.Args[i]
+				if parsedAddr, ok := parseSocksAddr(os.Args[i+1]); ok {
+					cliSocks5 = parsedAddr
+					i++
+				}
 			}
 		case "-s", "--strategy", "-strategy":
 			if i+1 < len(os.Args) {
@@ -176,6 +207,18 @@ func main() {
 				}
 			}
 		default:
+			if strings.HasPrefix(arg, "--socks5=") || strings.HasPrefix(arg, "-socks5=") ||
+				strings.HasPrefix(arg, "--socks=") || strings.HasPrefix(arg, "-socks=") {
+				val := arg[strings.Index(arg, "=")+1:]
+				if parsedAddr, ok := parseSocksAddr(val); ok {
+					cliSocks5 = parsedAddr
+				} else if val != "" {
+					cliSocks5 = val
+				} else {
+					cliSocks5 = "127.0.0.1:1080"
+				}
+				continue
+			}
 			if strings.HasPrefix(arg, "-") {
 				printUsage()
 				return
@@ -256,7 +299,11 @@ func main() {
 	if cliSocks5 != "" {
 		socks5Addr = cliSocks5
 	} else if parsedConfig != nil && parsedConfig.Socks5 != "" {
-		socks5Addr = parsedConfig.Socks5
+		if addr, ok := parseSocksAddr(parsedConfig.Socks5); ok {
+			socks5Addr = addr
+		} else {
+			socks5Addr = parsedConfig.Socks5
+		}
 	}
 
 	if socks5Addr != "" {

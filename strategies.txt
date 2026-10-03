@@ -12,23 +12,27 @@
 При запуске с правами root (sudo) TravonetWG автоматически открывает сырые L3-сокеты
 (AF_INET, SOCK_RAW, IPPROTO_RAW с флагами IP_HDRINCL и IP_NODEFRAG). Это дает возможность
 нарезать исходящий IP-пакет рукопожатия на физические фрагменты и инъецировать фейки.
-При этом флаг --socks5 поднимает локальный прокси без изменения системных маршрутов ОС.
+При этом флаг --socks (или --socks5) поднимает локальный прокси без изменения системных маршрутов ОС.
+Адрес и порт опциональны: если не указаны, используется 127.0.0.1:1080. Можно указать только порт (например, 1088) или полный адрес (0.0.0.0:1088).
 
 Команда для запуска со стандартной проверенной стратегией и подробным логом:
-  sudo ./travonet-wg -c warp.conf --socks5 127.0.0.1:1080 -d
+  sudo ./travonet-wg -c warp.conf --socks -d
+
+Команда с указанием кастомного порта:
+  sudo ./travonet-wg -c warp.conf --socks 1088 -d
 
 Команда с явным указанием стратегии и автоматическим подбором TTL:
-  sudo ./travonet-wg -c warp.conf --socks5 127.0.0.1:1080 -s "junk(64) -> fake_udp(148) -> frag(8) -> frag(148)" --fake-ttl auto -d
+  sudo ./travonet-wg -c warp.conf --socks 1080 -s "junk(64) -> fake_udp(148) -> frag(8) -> frag(148)" --fake-ttl auto -d
 
 Команда с фиксированным TTL фейка (например, TTL=10 хопов):
-  sudo ./travonet-wg -c warp.conf --socks5 127.0.0.1:1080 -s "junk(64) -> fake_udp(148) -> frag(8) -> frag(148)" --fake-ttl 10 -d
+  sudo ./travonet-wg -c warp.conf --socks 1080 -s "junk(64) -> fake_udp(148) -> frag(8) -> frag(148)" --fake-ttl 10 -d
 
 Проверка работы SOCKS5 через curl (в соседнем терминале):
   curl -x socks5h://127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace
   (В выводе должно быть: warp=on)
 
 Запуск без root (чистый userspace через setsockopt IP_TTL):
-  ./travonet-wg -c warp.conf --socks5 127.0.0.1:1080 -d
+  ./travonet-wg -c warp.conf --socks -d
 
 Запуск в качестве системного VPN (перенаправление всего интернета через TUN):
   sudo ./run_warp.sh warp.conf
