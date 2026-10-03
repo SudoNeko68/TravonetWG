@@ -1,166 +1,197 @@
-# TravonetWG 
+# TravonetWG
 
-[![Go Version](https://img.shields.io/badge/Go-1.22%2B-blue.svg)](https://go.dev)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![WireGuard Compatible](https://img.shields.io/badge/WireGuard-100%25%20Server%20Compatible-brightgreen.svg)](https://www.wireguard.com)
-
-**TravonetWG** is an advanced in-client L3 evasion fork of [`wireguard-go`](https://git.zx2c4.com/wireguard-go). It bypasses deep packet inspection (TSPU / DPI) in restrictive network environments without requiring any server-side changes, special patches, or non-standard protocols.
----
-
-##  How It Works: The Proven Evasion Pipeline
-
-During a standard WireGuard connection, the client sends a distinct 148-byte UDP packet (`0x01` handshake initiation). TSPU boxes detect the 148-byte length on UDP ports and block the flow.
-
-TravonetWG intercepts handshake initiation packets at the raw socket level and executes an evasion pipeline:
-
-```
-[Client] ──(1) junk UDP datagram (64B)─────────────────────────────► [DPI] (confused flow)
-         ──(2) fake UDP handshake (148B, TTL=10..11)───────────────► [TSPU / DPI] (state poisoned) ───X (dies before server)
-         ──(3) Frag #1 (offset=0, len=8, MF=1, TTL=64)────────────► [TSPU / DPI] ───► [WireGuard Server]
-         ──(4) Frag #2 (offset=8, len=148, MF=0, TTL=64)──────────► [TSPU / DPI] ───► [WireGuard Server]
-```
-
-1. **Pre-Junk (`junk(64)`):** A small random UDP datagram precedes the handshake, disrupting DPI protocol-matching heuristics.
-2. **Fake UDP (`fake_udp(148, ttl=auto)`):** A complete 148-byte UDP datagram with `0x01` initiation byte sent with a low TTL (calculated by Auto-TTL). It reaches the ISP's TSPU box (hops 8–11), registers inside the DPI's state table, and expires in transit before reaching the destination server.
-3. **Transport Split Fragmentation (`frag(8)` + `frag(148)`):**
-   - Fragment 1 contains **only** the 8-byte UDP header (no WireGuard data).
-   - Fragment 2 contains the 148-byte WireGuard payload without UDP ports.
-   - Intermediate routers and NAT reassemble standard RFC 791 fragments cleanly, and the standard WireGuard server receives the full, legitimate Handshake Initiation packet.
+Клиентская реализация протокола WireGuard на базе wireguard-go с встроенным механизмом обхода глубокого анализа пакетов (DPI / ТСПУ) на уровнях L3 и L4. Работает с любыми стандартными немодифицированными серверами WireGuard (включая Cloudflare WARP, коммерческие VPN-провайдеры и стандартные серверы на Linux).
 
 ---
 
-##  Dual Configuration Modes
+## Архитектура и режимы работы
 
-TravonetWG provides two distinct modes depending on your preference:
+TravonetWG поддерживает два основных режима функционирования:
 
-### Mode 1: Embedded Evasion Settings in `.conf`
-Add evasion directives directly inside the `[Interface]` section of your WireGuard configuration:
+### 1. Режим TUN (системный сетевой интерфейс)
+В этом режиме программа создает системный сетевой интерфейс `tun` и маршрутизирует трафик операционной системы через WireGuard-туннель.
+- Требует прав суперпользователя (`root` или capability `CAP_NET_ADMIN` и `CAP_NET_RAW`).
+- Поддерживает полный спектр L3-десинхронизации: отправку фейковых пакетов и настоящую фрагментацию пакета рукопожатия (IP fragmentation) на уровне сырых сокетов (`raw sockets`) с флагами `IP_HDRINCL` и `IP_NODEFRAG`.
+
+### 2. Режим Userspace SOCKS5 Inbound (без root)
+В этом режиме программа не создает виртуальный сетевой интерфейс в операционной системе, а запускает встроенный локальный SOCKS5-прокси.
+- Работает полностью без прав суперпользователя (zero-root / unprivileged).
+- Сетевой стек TCP/IP реализован в пространстве пользователя с помощью встроенного gVisor netstack.
+- Обход DPI выполняется на уровне непривилегированного UDP-сокета через динамическое управление TTL (`setsockopt(IP_TTL)`) перед отправкой пакетов рукопожатия (отправка `junk` и фейковых пакетов рукопожатия с коротким временем жизни).
+
+---
+
+## Механизм обхода DPI (Десинхронизация)
+
+Стандартное рукопожатие WireGuard (Handshake Initiation) представляет собой характерный 148-байтный UDP-пакет с идентификатором типа `0x01`. Системы DPI анализируют сигнатуру и длину первого пакета сессии и сбрасывают или глушат соединение.
+
+TravonetWG перехватывает исходящие пакеты рукопожатия и выполняет настраиваемый конвейер десинхронизации:
+
+```
+[Клиент] --- (1) Pre-Junk UDP (64 байта, TTL=64) -------------------> [DPI / ТСПУ] (сбой эвристик)
+         --- (2) Fake Handshake UDP (148 байт, TTL=10, 0x01) -------> [DPI / ТСПУ] (травит состояние) ---X (умирает до сервера)
+         --- (3) Фрагмент #1 (offset=0, len=8, MF=1, TTL=64) -------> [DPI / ТСПУ] ---> [Сервер WireGuard]
+         --- (4) Фрагмент #2 (offset=8, len=148, MF=0, TTL=64) -----> [DPI / ТСПУ] ---> [Сервер WireGuard]
+```
+
+1. **Pre-Junk (`junk(64)`):** Отправка псевдослучайного пакета данных перед инициализацией для сбивания фильтров первого пакета на DPI.
+2. **Fake UDP (`fake_udp(148, ttl=auto)`):** Отправка фейкового пакета рукопожатия с низким значением TTL. Пакет достигает узлов ТСПУ (обычно 8-11 хопов на магистралях), регистрируется в таблицах DPI как сессия и отбрасывается маршрутизаторами в пути, не доходя до реального сервера.
+3. **Фрагментация заголовка и полезной нагрузки (`frag(8)` + `frag(148)`):**
+   - Первый IP-фрагмент содержит только 8 байт UDP-заголовка без сигнатуры WireGuard.
+   - Второй IP-фрагмент содержит 148 байт тела WireGuard без UDP-портов.
+   - Системы DPI без полной сборки IP-фрагментов не могут обнаружить сигнатуру WireGuard. Сервер WireGuard и промежуточный стек ОС собирают фрагменты согласно RFC 791, и рукопожатие успешно устанавливается.
+
+---
+
+## Автоматическое определение TTL (Auto-TTL)
+
+Для того чтобы фейковый пакет гарантированно дошел до оборудования ТСПУ на магистральных каналах провайдера, но не дошел до зарубежного сервера WireGuard, его значение TTL должно быть рассчитано корректно.
+
+В TravonetWG встроен механизм зондирования маршрута (`Auto-TTL`):
+- Клиент в фоновом режиме перед запуском отправляет короткую серию зондирующих пакетов и определяет общее число хопов до конечного узла.
+- Оптимальный TTL для фейка вычисляется по формуле `totalHops - 4`, с ограничением диапазоном 8-11 хопов (зона действия ТСПУ).
+- При значении `FakeTTL = auto` или передаче CLI-флага `--fake-ttl auto` подбор осуществляется автоматически.
+
+---
+
+## Конфигурация
+
+Поддерживаются два способа настройки.
+
+### Способ 1: Параметры десинхронизации внутри файла .conf
+Директивы десинхронизации можно указать непосредственно в секции `[Interface]` конфигурационного файла WireGuard:
 
 ```ini
 [Interface]
-PrivateKey = <your_private_key>
+PrivateKey = aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 Address = 172.16.0.2/32
 DNS = 1.1.1.1
 MTU = 1280
 
-# Evasion directives:
+# Параметры десинхронизации TravonetWG:
 FakeTTL = auto
 PreJunk = 64
 Strategy = junk(64) -> fake_udp(148) -> frag(8) -> frag(148)
 
 [Peer]
-PublicKey = <server_public_key>
-Endpoint = 8.34.70.70:500
+PublicKey = bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+Endpoint = 162.159.192.1:2408
 AllowedIPs = 0.0.0.0/0
 PersistentKeepalive = 25
 ```
 
-Launch with:
+Запуск:
 ```bash
 sudo ./travonet-wg -f -c warp.conf warp
 ```
 
----
-
-### Mode 2: Vanilla WireGuard `.conf` + CLI Flags (or Zero-Config)
-Use a **100% standard, unpatched WireGuard `.conf` file** (e.g., exported directly from Cloudflare WARP, Mullvad, ProtonVPN, or standard `wg-quick`):
+### Способ 2: Чистый стандартный WireGuard-конфиг + CLI-флаги
+Можно использовать стандартный конфигурационный файл WireGuard (например, экспортированный из Cloudflare WARP, Mullvad или стандартного клиента `wg-quick`) без модификаций:
 
 ```ini
 [Interface]
-PrivateKey = <your_private_key>
+PrivateKey = aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 Address = 172.16.0.2/32
 DNS = 1.1.1.1
 MTU = 1280
 
 [Peer]
-PublicKey = <server_public_key>
-Endpoint = 8.34.70.70:500
+PublicKey = bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+Endpoint = 162.159.192.1:2408
 AllowedIPs = 0.0.0.0/0
 PersistentKeepalive = 25
 ```
 
-#### Option A: Zero-Config (Intelligent Auto-Detection)
-Pass no evasion flags. TravonetWG will automatically probe the hop distance to the endpoint, configure Auto-TTL, and run the proven default evasion pipeline:
+#### Запуск с автоматическим обходом (Zero-Config):
+Если флаги не переданы, программа автоматически измеряет расстояние до сервера и применяет стандартный проверенный профиль обхода:
 ```bash
-sudo ./travonet-wg -f -c clean-warp.conf warp
+sudo ./travonet-wg -f -c clean.conf warp
 ```
 
-#### Option B: CLI Parameter Overrides
-Override parameters on the command line (CLI flags always take highest precedence):
+#### Переопределение параметров через CLI:
+Флаги командной строки имеют наивысший приоритет:
 ```bash
-# Auto-measure TTL:
-sudo ./travonet-wg -f -c clean-warp.conf --fake-ttl auto warp
+# Установка конкретного TTL фейка:
+sudo ./travonet-wg -f -c clean.conf --fake-ttl 10 warp
 
-# Specific custom TTL:
-sudo ./travonet-wg -f -c clean-warp.conf --fake-ttl 10 warp
+# Пользовательская стратегия:
+sudo ./travonet-wg -f -c clean.conf -s "junk(64) -> fake_udp(148) -> frag(8) -> frag(148)" warp
 
-# Custom evasion pipeline:
-sudo ./travonet-wg -f -c clean-warp.conf -s "junk(64) -> fake_udp(148) -> frag(8) -> frag(148)" warp
-
-# Disable evasion completely (run as standard wireguard-go):
-sudo ./travonet-wg -f -c clean-warp.conf --no-evasion warp
+# Отключение механизма десинхронизации (работа в режиме стандартного wireguard-go):
+sudo ./travonet-wg -f -c clean.conf --no-evasion warp
 ```
 
 ---
 
-##  Auto-TTL Hop Distance Probe
+## DSL описания стратегий десинхронизации
 
-Because TSPU DPI hardware is located within domestic transit/backbone networks (typically hops 8–11 in Russia), fake packets must have a TTL large enough to traverse TSPU, but small enough to expire before reaching the foreign server.
+Язык описания последовательностей пакетов позволяет гибко компоновать цепочки:
 
-TravonetWG includes a built-in traceroute engine (`conn.MeasureTargetTTL`) that:
-- Probes the network path to the endpoint in ~1 second using non-invasive UDP/ICMP bursts.
-- Determines total hop count (e.g. 15 hops to Cloudflare Stockholm).
-- Computes optimal `FakeTTL = totalHops - 4` (constrained within the Russian DPI bypass window: 8–11).
-
----
-
-##  Strategy DSL Syntax
-
-TravonetWG features a domain-specific language (DSL) to customize packet sequences:
-
-| Action | Description | Example |
+| Команда | Описание | Пример |
 | :--- | :--- | :--- |
-| `junk(size, [badsum])` | Sends a random UDP packet | `junk(64)`, `junk(size=128, badsum=true)` |
-| `fake_udp(size, [ttl])` | Full UDP datagram with `0x01` initiation header | `fake_udp(148)`, `fake_udp(size=148, ttl=10)` |
-| `frag(offset, len, [mf, ttl])` | Legitimate IP fragment of the handshake | `frag(8)`, `frag(offset=0, len=8, mf=true)` |
-| `fake_frag(offset, len, [mf, ttl])` | Injected fake fragment | `fake_frag(offset=88, len=32, mf=0, ttl=10)` |
-| `sleep(duration)` | Timing delay between packets | `sleep(10ms)` |
+| `junk(size, [badsum])` | Отправка случайного UDP-пакета заданного размера | `junk(64)`, `junk(size=128, badsum=true)` |
+| `fake_udp(size, [ttl])` | Полный UDP-пакет с фейковым заголовком рукопожатия | `fake_udp(148)`, `fake_udp(size=148, ttl=10)` |
+| `frag(offset, len, [mf, ttl])` | Настоящий фрагмент пакета рукопожатия | `frag(8)`, `frag(offset=0, len=8, mf=true)` |
+| `fake_frag(offset, len, [mf, ttl])` | Инъецируемый фейковый IP-фрагмент | `fake_frag(offset=88, len=32, mf=0, ttl=10)` |
+| `sleep(duration)` | Пауза между отправкой пакетов | `sleep(10ms)` |
+
+Оператор `->` связывает шаги в единый последовательный конвейер.
 
 ---
 
-##  Building & Running
+## Сборка
 
-### Prerequisites
-- Linux with Go 1.22+ installed
-- Root permissions (required for raw sockets and TUN interface creation)
+### Требования
+- Операционная система Linux
+- Компилятор Go версии 1.22 или выше
 
-### Build
+### Компиляция бинарного файла
 ```bash
 git clone https://github.com/SudoNeko68/TravonetWG.git
 cd TravonetWG
 go build -o travonet-wg .
 ```
 
-### Full System VPN Launcher (`run_warp.sh`)
-To route all system internet traffic and DNS through Cloudflare WARP using TravonetWG:
+---
+
+## Примеры запуска
+
+### 1. Запуск локального SOCKS5-прокси (без прав root)
+Запуск прокси-сервера в пространстве пользователя на локальном адресе `127.0.0.1:1088`:
+
 ```bash
-# Mode 1 (embedded config):
-sudo ./run_warp.sh warp.conf
-
-# Mode 2 (vanilla config + auto evasion):
-sudo ./run_warp.sh clean-warp.conf
-
-# Mode 2 with CLI override:
-sudo ./run_warp.sh clean-warp.conf --fake-ttl 10
+./travonet-wg -c warp.conf --socks5 127.0.0.1:1088
 ```
 
-Verify your connection:
+Проверка соединения через curl:
+```bash
+curl -x socks5h://127.0.0.1:1088 https://cloudflare.com/cdn-cgi/trace
+```
+В выводе команды параметр `warp=on` подтверждает успешную передачу трафика через туннель.
+
+### 2. Запуск системного VPN через скрипт run_warp.sh (с правами root)
+Скрипт `run_warp.sh` автоматически настраивает системную маршрутизацию и DNS для направления всего интернет-трафика через туннель:
+
+```bash
+# Стандартный запуск с автоматическим подбором TTL:
+sudo ./run_warp.sh warp.conf
+
+# Запуск с указанием конкретного TTL для фейковых пакетов:
+sudo ./run_warp.sh warp.conf --fake-ttl 10
+```
+
+Проверка маршрутизации:
 ```bash
 curl https://cloudflare.com/cdn-cgi/trace
-# Expected: warp=on, loc=RU, colo=ARN
+```
+
+### 3. Прямой запуск с созданием интерфейса tun (с правами root)
+```bash
+sudo ./travonet-wg -f -c warp.conf warp
 ```
 
 ---
 
-## License
-MIT License. Copyright (C) 2017-2025 WireGuard LLC. Copyright (C) 2026 Travonet.
+## Лицензия
+
+Проект распространяется под лицензией MIT. Исходный код базируется на разработках WireGuard LLC (C) 2017-2025. Все права защищены.
