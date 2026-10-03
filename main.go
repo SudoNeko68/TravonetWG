@@ -9,7 +9,10 @@ package main
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
+	"net"
+	"net/netip"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -22,7 +25,9 @@ import (
 	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/device"
 	"golang.zx2c4.com/wireguard/ipc"
+	"golang.zx2c4.com/wireguard/proxy"
 	"golang.zx2c4.com/wireguard/tun"
+	"golang.zx2c4.com/wireguard/tun/netstack"
 )
 
 const (
@@ -57,8 +62,13 @@ Modes:
       Or run with zero flags to use intelligent auto-detection and defaults:
           %s -f -c wg0.conf wg0
 
+  Mode 3 (Zero-Root Userspace SOCKS5 Inbound):
+      Run pure userspace SOCKS5 proxy without root, TUN device, or routing changes:
+          %s -c wg0.conf --socks5 127.0.0.1:1080
+
 Options:
   -c, --config FILE       Load WireGuard configuration file (.conf)
+  --socks5 [ADDR]         Start userspace SOCKS5 proxy (default: 127.0.0.1:1080)
   -s, --strategy DSL      Evasion pipeline DSL (default: "junk(64) -> fake_udp(148) -> frag(8) -> frag(148)")
   --fake-ttl N|auto       TTL for fake packets (number 1-255 or 'auto' for hop distance probe)
   --pre-junk N            Size in bytes of initial junk UDP packet (default: 64, 0 to disable)
@@ -67,7 +77,7 @@ Options:
   -f, --foreground        Run in foreground instead of daemonizing
   -h, --help              Show this help message
   --version               Show version information
-`, os.Args[0], os.Args[0], os.Args[0])
+`, os.Args[0], os.Args[0], os.Args[0], os.Args[0])
 }
 
 func warning() {
@@ -119,6 +129,7 @@ func main() {
 	var cliFakeTTL int = 0
 	var cliStrategy string
 	var cliPreJunk int = -1
+	var cliSocks5 string
 
 	for i := 1; i < len(os.Args); i++ {
 		arg := os.Args[i]
@@ -136,6 +147,12 @@ func main() {
 			if i+1 < len(os.Args) {
 				i++
 				configFile = os.Args[i]
+			}
+		case "--socks5", "-socks5", "--socks", "-socks":
+			cliSocks5 = "127.0.0.1:1080"
+			if i+1 < len(os.Args) && !strings.HasPrefix(os.Args[i+1], "-") {
+				i++
+				cliSocks5 = os.Args[i]
 			}
 		case "-s", "--strategy", "-strategy":
 			if i+1 < len(os.Args) {
@@ -233,6 +250,24 @@ func main() {
 		} else {
 			evasionCfg.FakeTTL = 11 // Fallback default if endpoint not directly known
 		}
+	}
+
+	var socks5Addr string
+	if cliSocks5 != "" {
+		socks5Addr = cliSocks5
+	} else if parsedConfig != nil && parsedConfig.Socks5 != "" {
+		socks5Addr = parsedConfig.Socks5
+	}
+
+	if socks5Addr != "" {
+		if parsedConfig == nil {
+			fmt.Fprintln(os.Stderr, "Error: SOCKS5 mode requires a WireGuard configuration file (-c config.conf)")
+			os.Exit(ExitSetupFailed)
+			return
+		}
+
+		runSocks5Userspace(socks5Addr, parsedConfig, evasionCfg, debug)
+		return
 	}
 
 	if interfaceName == "" {
@@ -449,4 +484,119 @@ func main() {
 	device.Close()
 
 	logger.Verbosef("Shutting down")
+}
+
+func runSocks5Userspace(socks5Addr string, parsedConfig *conf.Config, evasionCfg conn.EvasionConfig, debug bool) {
+	// 1. Validate strategy if specified
+	if evasionCfg.Strategy != "" && evasionCfg.Strategy != "default" {
+		if _, err := conn.ParseStrategy(evasionCfg.Strategy, evasionCfg.FakeTTL, evasionCfg.NormalTTL); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: invalid evasion strategy: %v\n", err)
+			os.Exit(ExitSetupFailed)
+			return
+		}
+	}
+
+	evasionCfg.Debug = debug
+
+	// 2. Parse local addresses and DNS servers from parsedConfig
+	var localIPs []netip.Addr
+	for _, a := range parsedConfig.Addresses {
+		addrStr := a
+		if idx := strings.Index(addrStr, "/"); idx > 0 {
+			addrStr = addrStr[:idx]
+		}
+		if ip, err := netip.ParseAddr(addrStr); err == nil {
+			localIPs = append(localIPs, ip)
+		}
+	}
+	if len(localIPs) == 0 {
+		localIPs = []netip.Addr{netip.MustParseAddr("172.16.0.2")}
+	}
+
+	var dnsIPs []netip.Addr
+	for _, d := range parsedConfig.DNS {
+		if ip, err := netip.ParseAddr(d); err == nil {
+			dnsIPs = append(dnsIPs, ip)
+		}
+	}
+	if len(dnsIPs) == 0 {
+		dnsIPs = []netip.Addr{netip.MustParseAddr("1.1.1.1")}
+	}
+
+	mtu := parsedConfig.MTU
+	if mtu <= 0 {
+		mtu = 1280
+	}
+
+	// 3. Create userspace netstack TUN device (No /dev/net/tun needed!)
+	tunDev, tnet, err := netstack.CreateNetTUN(localIPs, dnsIPs, mtu)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error creating netstack TUN: %v\n", err)
+		os.Exit(ExitSetupFailed)
+		return
+	}
+
+	logLevel := device.LogLevelError
+	if debug {
+		logLevel = device.LogLevelVerbose
+	}
+	logger := device.NewLogger(logLevel, "(socks5) ")
+
+	// 4. Create EvasionBind wrapping StdNetBind
+	bind := conn.NewEvasionBind(conn.NewDefaultBind(), evasionCfg)
+	wgDevice := device.NewDevice(tunDev, bind, logger)
+
+	// 5. Apply WireGuard UAPI config
+	uapiStr, err := parsedConfig.ToUAPI()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error building UAPI config: %v\n", err)
+		os.Exit(ExitSetupFailed)
+		return
+	}
+
+	if err := wgDevice.IpcSet(uapiStr); err != nil {
+		fmt.Fprintf(os.Stderr, "Error applying WireGuard config: %v\n", err)
+		os.Exit(ExitSetupFailed)
+		return
+	}
+
+	if err := wgDevice.Up(); err != nil {
+		fmt.Fprintf(os.Stderr, "Error bringing up WireGuard device: %v\n", err)
+		os.Exit(ExitSetupFailed)
+		return
+	}
+
+	// 6. Start SOCKS5 Server
+	socksServer := proxy.NewSOCKS5Server(socks5Addr, tnet.DialContext)
+	socksServer.Debug = debug
+
+	fmt.Println("┌──────────────────────────────────────────────────────────────┐")
+	fmt.Println("│                                                              │")
+	fmt.Println("│   TravonetWG: SOCKS5 Inbound Proxy Active                    │")
+	fmt.Println("│   Zero-Root / Pure Userspace Mode (gVisor Netstack)          │")
+	fmt.Println("│                                                              │")
+	fmt.Println("└──────────────────────────────────────────────────────────────┘")
+	fmt.Printf("🚀 SOCKS5 Proxy Listening on: %s\n", socks5Addr)
+	fmt.Printf("📜 Evasion Strategy:          %s\n", evasionCfg.Strategy)
+	fmt.Printf("🎯 Fake TTL:                  %d\n", evasionCfg.FakeTTL)
+	fmt.Printf("🌐 Internal Tunnel IP:        %s (DNS: %s)\n", localIPs[0], dnsIPs[0])
+	fmt.Println("💡 Example usage:")
+	fmt.Printf("   curl -x socks5h://%s https://cloudflare.com/cdn-cgi/trace\n", socks5Addr)
+	fmt.Println("   Press Ctrl+C to terminate.")
+
+	// Trap termination signals
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, unix.SIGTERM)
+
+	go func() {
+		if err := socksServer.ListenAndServe(); err != nil && !errors.Is(err, net.ErrClosed) {
+			fmt.Fprintf(os.Stderr, "SOCKS5 server error: %v\n", err)
+		}
+	}()
+
+	<-sigCh
+	fmt.Println("\n🛑 Stopping SOCKS5 proxy and WireGuard device...")
+	_ = socksServer.Close()
+	wgDevice.Close()
+	fmt.Println("✅ Stopped cleanly.")
 }

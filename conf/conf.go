@@ -28,6 +28,7 @@ type Config struct {
 	Strategy    string
 	FakeTTL     int
 	PreJunkSize int
+	Socks5      string
 
 	// [Peer]
 	PublicKey           string
@@ -110,6 +111,8 @@ func ParseConfigFile(path string) (*Config, error) {
 				if sz, err := strconv.Atoi(val); err == nil {
 					cfg.PreJunkSize = sz
 				}
+			case "socks5", "socks", "socks_proxy", "socks5_proxy":
+				cfg.Socks5 = val
 			}
 
 		case "peer":

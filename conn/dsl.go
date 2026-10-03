@@ -140,7 +140,7 @@ func FivePacketStrategy(fakeTTL, normalTTL int) *Strategy {
 			},
 			{
 				Action: ActionFrag,
-				Offset: UDPHeaderSize,     // 8 bytes
+				Offset: UDPHeaderSize,      // 8 bytes
 				Length: DefaultPart1WGSize, // 80 bytes
 				MF:     true,
 				TTL:    normalTTL,
@@ -294,7 +294,7 @@ func ParseStrategy(dsl string, defaultFakeTTL, defaultNormalTTL int) (*Strategy,
 			step := Step{
 				Action: ActionFakeFrag,
 				Offset: currentOffset,
-				Length: 32, // default 32B noise
+				Length: 32,    // default 32B noise
 				MF:     false, // default false (Early-Termination trick!)
 				TTL:    defaultFakeTTL,
 			}
