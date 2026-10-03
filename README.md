@@ -1,23 +1,10 @@
-# TravonetWG 🚀
+# TravonetWG 
 
 [![Go Version](https://img.shields.io/badge/Go-1.22%2B-blue.svg)](https://go.dev)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![WireGuard Compatible](https://img.shields.io/badge/WireGuard-100%25%20Server%20Compatible-brightgreen.svg)](https://www.wireguard.com)
 
 **TravonetWG** is an advanced in-client L3 evasion fork of [`wireguard-go`](https://git.zx2c4.com/wireguard-go). It bypasses deep packet inspection (TSPU / DPI) in restrictive network environments without requiring any server-side changes, special patches, or non-standard protocols.
-
----
-
-## 🌟 Key Differences from AmneziaWG (AWG)
-
-| Feature | AmneziaWG (AWG) | TravonetWG |
-| :--- | :--- | :--- |
-| **Server Requirements** | Requires custom, patched AWG server | **100% standard unpatched WireGuard servers** (Cloudflare WARP, standard VPS, commercial WG) |
-| **Evasion Layer** | L4/L7 protocol obfuscation (Magic headers H1-H4, S1-S2) | **L3 (IP layer)** via raw sockets with `IP_HDRINCL` and `IP_NODEFRAG` |
-| **TSPU Bypass Vector** | Scrambles packet headers | Splits transport headers from payload (`frag(8)` + `frag(148)`) + DPI-terminating fake packets (`fake_udp`) |
-| **Wire Traffic** | Still sends intact 148B UDP datagrams if magic headers are disabled | The 148B packet **never exists intact on the wire** during DPI inspection |
-| **Configuration** | Custom config keys (`Jc`, `Jmin`, `H1`...) | **Dual-mode:** Custom keys in `.conf` **OR** 100% pure vanilla WireGuard `.conf` |
-
 ---
 
 ## 🛠️ How It Works: The Proven Evasion Pipeline
