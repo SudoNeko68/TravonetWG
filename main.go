@@ -129,6 +129,7 @@ Options:
   --pre-junk N                  Size in bytes of initial junk UDP packet (default: 64, 0 to disable)
   --no-evasion                  Disable all evasion mechanisms (run as standard wireguard-go)
   -d, --debug                   Enable verbose debug logging
+  -v, --verbose                 Log every transport data packet (verbose traffic tracking)
   -D, --daemon                  Run in background as daemon (default: foreground)
   -f, --foreground              Run in foreground (default)
   -h, --help                    Show this help message
@@ -199,6 +200,9 @@ func main() {
 			daemonize = false
 		case "-d", "--debug", "-debug":
 			debug = true
+		case "-v", "--verbose", "-verbose":
+			debug = true
+			evasionCfg.VerbosePacket = true
 		case "--no-evasion":
 			evasionCfg.Enabled = false
 		case "-c", "--config", "-config":
@@ -567,6 +571,10 @@ func main() {
 	}()
 
 	// clean up
+
+	if parsedConfig != nil {
+		parsedConfig.CleanupRoutes(interfaceName)
+	}
 
 	uapi.Close()
 	device.Close()

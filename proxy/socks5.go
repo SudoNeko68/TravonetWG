@@ -265,10 +265,17 @@ func (s *SOCKS5Server) handleConnection(client net.Conn) {
 
 	remote, err := s.dialCtx(ctx, "tcp", targetAddr)
 	if err != nil {
+		if s.Debug {
+			fmt.Printf("DEBUG: (socks5) ❌ Dial to %s failed: %v\n", targetAddr, err)
+		}
 		sendReply(client, repConnectionRefused, nil, 0)
 		return
 	}
 	defer remote.Close()
+
+	if s.Debug {
+		fmt.Printf("DEBUG: (socks5) 🔗 Dialed %s successfully!\n", targetAddr)
+	}
 
 	// 4. Send Success Response
 	if err := sendReply(client, repSuccess, net.ParseIP("0.0.0.0"), 0); err != nil {

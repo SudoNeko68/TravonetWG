@@ -293,6 +293,13 @@ func (b *EvasionBind) Send(bufs [][]byte, ep Endpoint) error {
 			}
 		} else {
 			// Type 4 transport data or keepalives: fast path!
+			if b.cfg.VerbosePacket && len(buf) > 0 {
+				if len(buf) == 32 {
+					fmt.Printf("DEBUG: (evasion) [TRAVONET-WG] 📤 >>> Transport Keepalive (32 bytes) to %s\n", ep.DstToString())
+				} else {
+					fmt.Printf("DEBUG: (evasion) [TRAVONET-WG] 📤 >>> Transport Data (%d bytes) to %s\n", len(buf), ep.DstToString())
+				}
+			}
 			standardBufs = append(standardBufs, buf)
 		}
 	}
