@@ -129,8 +129,13 @@ func expiredZeroKeyMaterial(peer *Peer) {
 }
 
 func expiredPersistentKeepalive(peer *Peer) {
-	if peer.persistentKeepaliveInterval.Load() > 0 {
+	keepalive := peer.persistentKeepaliveInterval.Load()
+	if keepalive > 0 {
+		peer.device.log.Verbosef("%v - Persistent keepalive triggered (%ds)", peer, keepalive)
 		peer.SendKeepalive()
+		if peer.timersActive() {
+			peer.timers.persistentKeepalive.Mod(time.Duration(keepalive) * time.Second)
+		}
 	}
 }
 
@@ -210,6 +215,9 @@ func (peer *Peer) timersStart() {
 	peer.timers.handshakeAttempts.Store(0)
 	peer.timers.sentLastMinuteHandshake.Store(false)
 	peer.timers.needAnotherKeepalive.Store(false)
+	if keepalive := peer.persistentKeepaliveInterval.Load(); keepalive > 0 {
+		peer.timers.persistentKeepalive.Mod(time.Duration(keepalive) * time.Second)
+	}
 }
 
 func (peer *Peer) timersStop() {

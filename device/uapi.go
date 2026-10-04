@@ -356,6 +356,9 @@ func (device *Device) handlePeerLine(peer *ipcSetPeer, key, value string) error 
 		}
 
 		old := peer.persistentKeepaliveInterval.Swap(uint32(secs))
+		if secs != 0 && old != uint32(secs) {
+			peer.timersAnyAuthenticatedPacketTraversal()
+		}
 
 		// Send immediate keepalive if we're turning it on and before it wasn't on.
 		peer.pkaOn = old == 0 && secs != 0

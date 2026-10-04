@@ -59,11 +59,12 @@ func DefaultEvasionConfig() EvasionConfig {
 // EvasionBind wraps a standard Bind and intercepts Handshake Initiation packets
 type EvasionBind struct {
 	Bind
-	cfg        EvasionConfig
-	mu         sync.RWMutex
-	rawFd      int
-	actualPort uint16
-	closed     bool
+	cfg                EvasionConfig
+	mu                 sync.RWMutex
+	rawFd              int
+	rawSocketAttempted bool
+	actualPort         uint16
+	closed             bool
 }
 
 var (
@@ -158,6 +159,10 @@ func (b *EvasionBind) ensureRawSocketLocked() (int, error) {
 	if b.rawFd >= 0 {
 		return b.rawFd, nil
 	}
+	if b.rawSocketAttempted {
+		return -1, syscall.EPERM
+	}
+	b.rawSocketAttempted = true
 	fd, err := initRawSocket()
 	if err != nil {
 		if b.cfg.Debug {
@@ -233,17 +238,26 @@ func (b *EvasionBind) Close() error {
 		syscall.Close(b.rawFd)
 		b.rawFd = -1
 	}
+	b.rawSocketAttempted = false
 	return b.Bind.Close()
 }
 
 func (b *EvasionBind) Send(bufs [][]byte, ep Endpoint) error {
-	b.mu.Lock()
-	if b.cfg.Enabled && b.rawFd < 0 {
-		_, _ = b.ensureRawSocketLocked()
-	}
+	b.mu.RLock()
 	rawFd := b.rawFd
 	actualPort := b.actualPort
-	b.mu.Unlock()
+	attempted := b.rawSocketAttempted
+	b.mu.RUnlock()
+
+	if b.cfg.Enabled && rawFd < 0 && !attempted {
+		b.mu.Lock()
+		if b.rawFd < 0 && !b.rawSocketAttempted {
+			_, _ = b.ensureRawSocketLocked()
+		}
+		rawFd = b.rawFd
+		actualPort = b.actualPort
+		b.mu.Unlock()
+	}
 
 	// If evasion disabled or IPv6 endpoint, standard send
 	if !b.cfg.Enabled || ep.DstIP().Is6() {

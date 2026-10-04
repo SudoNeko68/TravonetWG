@@ -513,7 +513,10 @@ func main() {
 			return
 		}
 
-		logger.Verbosef("✅ WireGuard configuration from %s applied successfully to %s", configFile, interfaceName)
+		if conf.IsPort500Endpoint(parsedConfig.Endpoint) {
+			logger.Verbosef("💡 Port 500 endpoint detected (%s): PersistentKeepalive clamped to %ds to prevent router IPsec ALG / NAT session reset", parsedConfig.Endpoint, parsedConfig.PersistentKeepalive)
+		}
+		logger.Verbosef("✅ WireGuard configuration from %s applied successfully to %s (PersistentKeepalive: %ds)", configFile, interfaceName, parsedConfig.PersistentKeepalive)
 	}
 
 	logger.Verbosef("Device started")
@@ -667,6 +670,10 @@ func runSocks5Userspace(socks5Addr string, parsedConfig *conf.Config, evasionCfg
 	fmt.Printf("🚀 SOCKS5 Proxy Listening on: %s\n", socks5Addr)
 	fmt.Printf("📜 Evasion Strategy:          %s\n", evasionCfg.Strategy)
 	fmt.Printf("🎯 Fake TTL:                  %d\n", evasionCfg.FakeTTL)
+	fmt.Printf("⏱️ Persistent Keepalive:      %ds\n", parsedConfig.PersistentKeepalive)
+	if conf.IsPort500Endpoint(parsedConfig.Endpoint) {
+		fmt.Printf("💡 Port 500 Endpoint:         %s (Keepalive clamped to %ds to prevent router IPsec ALG / NAT timeout)\n", parsedConfig.Endpoint, parsedConfig.PersistentKeepalive)
+	}
 	fmt.Printf("🌐 Internal Tunnel IP:        %s (DNS: %s)\n", localIPs[0], dnsIPs[0])
 	fmt.Println("💡 Example usage:")
 	fmt.Printf("   curl -x socks5h://%s https://cloudflare.com/cdn-cgi/trace\n", socks5Addr)

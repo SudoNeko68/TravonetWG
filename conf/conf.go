@@ -10,6 +10,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"strconv"
@@ -111,6 +112,10 @@ func ParseConfigFile(path string) (*Config, error) {
 				if sz, err := strconv.Atoi(val); err == nil {
 					cfg.PreJunkSize = sz
 				}
+			case "persistentkeepalive", "persistent_keepalive", "persistent-keepalive":
+				if pka, err := strconv.Atoi(val); err == nil && pka > 0 {
+					cfg.PersistentKeepalive = pka
+				}
 			case "socks5", "socks", "socks_proxy", "socks5_proxy":
 				cfg.Socks5 = val
 			}
@@ -128,8 +133,8 @@ func ParseConfigFile(path string) (*Config, error) {
 						cfg.AllowedIPs = append(cfg.AllowedIPs, i)
 					}
 				}
-			case "persistentkeepalive":
-				if pka, err := strconv.Atoi(val); err == nil {
+			case "persistentkeepalive", "persistent_keepalive", "persistent-keepalive", "persistentkeepaliveinterval", "persistent_keepalive_interval":
+				if pka, err := strconv.Atoi(val); err == nil && pka > 0 {
 					cfg.PersistentKeepalive = pka
 				}
 			}
@@ -140,7 +145,30 @@ func ParseConfigFile(path string) (*Config, error) {
 		return nil, fmt.Errorf("error reading config: %w", err)
 	}
 
+	// Default PersistentKeepalive:
+	// WireGuard tunnels through NAT require periodic keepalives to prevent NAT state timeout.
+	// For Cloudflare WARP and typical router NATs, 25s can be too long, especially on port 500
+	// where IPsec ALG / NAT helpers drop non-IPsec UDP states after 15-20 seconds.
+	if cfg.PersistentKeepalive <= 0 {
+		cfg.PersistentKeepalive = 10
+	}
+	if IsPort500Endpoint(cfg.Endpoint) && cfg.PersistentKeepalive > 10 {
+		cfg.PersistentKeepalive = 5
+	}
+
 	return cfg, nil
+}
+
+// IsPort500Endpoint checks if the endpoint targets UDP port 500 (IKE / IPsec)
+func IsPort500Endpoint(endpoint string) bool {
+	if endpoint == "" {
+		return false
+	}
+	_, portStr, err := net.SplitHostPort(endpoint)
+	if err == nil && portStr == "500" {
+		return true
+	}
+	return strings.HasSuffix(endpoint, ":500")
 }
 
 // ToUAPI converts the parsed configuration to WireGuard UAPI format
