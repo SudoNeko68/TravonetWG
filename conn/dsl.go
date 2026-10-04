@@ -86,20 +86,15 @@ func (s *Strategy) String() string {
 	return strings.Join(parts, " -> ")
 }
 
-// DefaultStrategy creates the proven working evasion pipeline (Zapret Fake UDP + IPFrag2):
-// junk(64) -> fake_udp(148, ttl=fakeTTL) -> frag(8) -> frag(148)
+// DefaultStrategy creates the proven 5-step dual-fake evasion pipeline:
+// fake(148) -> frag(8) -> frag(72) -> fake(148) -> frag(76)
 func DefaultStrategy(fakeTTL, normalTTL int) *Strategy {
 	return &Strategy{
-		Raw: "junk(64) -> fake_udp(148) -> frag(8) -> frag(148)",
+		Raw: "fake(148) -> frag(8) -> frag(72) -> fake(148) -> frag(76)",
 		Steps: []Step{
 			{
-				Action: ActionJunk,
-				Length: 64,
-				TTL:    normalTTL,
-			},
-			{
 				Action: ActionFakeUDP,
-				Length: WGHandshakeInitiationSize, // 148 bytes (with 0x01 Handshake Initiation type)
+				Length: WGHandshakeInitiationSize,
 				TTL:    fakeTTL,
 			},
 			{
@@ -111,9 +106,21 @@ func DefaultStrategy(fakeTTL, normalTTL int) *Strategy {
 			},
 			{
 				Action: ActionFrag,
-				Offset: UDPHeaderSize,             // 8 bytes
-				Length: WGHandshakeInitiationSize, // 148 bytes
-				MF:     false,                     // Real termination for server
+				Offset: UDPHeaderSize, // 8 bytes
+				Length: 72,            // 72 bytes
+				MF:     true,
+				TTL:    normalTTL,
+			},
+			{
+				Action: ActionFakeUDP,
+				Length: WGHandshakeInitiationSize,
+				TTL:    fakeTTL,
+			},
+			{
+				Action: ActionFrag,
+				Offset: UDPHeaderSize + 72,                             // 80 bytes
+				Length: WGHandshakeInitiationSize + UDPHeaderSize - 80, // 76 bytes (80 + 76 = 156 bytes total)
+				MF:     false,                                          // Real termination for server
 				TTL:    normalTTL,
 			},
 		},

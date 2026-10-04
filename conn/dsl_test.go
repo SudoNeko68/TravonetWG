@@ -17,25 +17,29 @@ func TestParseDefaultStrategy(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if len(st.Steps) != 4 {
-		t.Fatalf("expected 4 steps in default strategy, got %d", len(st.Steps))
+	if len(st.Steps) != 5 {
+		t.Fatalf("expected 5 steps in default strategy, got %d", len(st.Steps))
 	}
 
-	// 1. Junk
-	if st.Steps[0].Action != ActionJunk || st.Steps[0].Length != 64 {
+	// 1. Fake UDP 1 (148 bytes, TTL=10)
+	if st.Steps[0].Action != ActionFakeUDP || st.Steps[0].Length != 148 || st.Steps[0].TTL != 10 {
 		t.Errorf("step 0 mismatch: %+v", st.Steps[0])
 	}
-	// 2. Fake UDP (148 bytes, TTL=10)
-	if st.Steps[1].Action != ActionFakeUDP || st.Steps[1].Length != 148 || st.Steps[1].TTL != 10 {
+	// 2. Frag 1 (8 bytes UDP header, MF=true)
+	if st.Steps[1].Action != ActionFrag || st.Steps[1].Length != 8 || st.Steps[1].Offset != 0 || !st.Steps[1].MF {
 		t.Errorf("step 1 mismatch: %+v", st.Steps[1])
 	}
-	// 3. Frag 1 (8 bytes UDP header, MF=true)
-	if st.Steps[2].Action != ActionFrag || st.Steps[2].Length != 8 || st.Steps[2].Offset != 0 || !st.Steps[2].MF {
+	// 3. Frag 2 (72 bytes WG payload, MF=true)
+	if st.Steps[2].Action != ActionFrag || st.Steps[2].Length != 72 || st.Steps[2].Offset != 8 || !st.Steps[2].MF {
 		t.Errorf("step 2 mismatch: %+v", st.Steps[2])
 	}
-	// 4. Frag 2 (148 bytes WG payload, MF=false, TTL=64)
-	if st.Steps[3].Action != ActionFrag || st.Steps[3].Length != 148 || st.Steps[3].Offset != 8 || st.Steps[3].MF != false {
+	// 4. Fake UDP 2 (148 bytes, TTL=10)
+	if st.Steps[3].Action != ActionFakeUDP || st.Steps[3].Length != 148 || st.Steps[3].TTL != 10 {
 		t.Errorf("step 3 mismatch: %+v", st.Steps[3])
+	}
+	// 5. Frag 3 (76 bytes WG payload, MF=false, TTL=64)
+	if st.Steps[4].Action != ActionFrag || st.Steps[4].Length != 76 || st.Steps[4].Offset != 80 || st.Steps[4].MF != false {
+		t.Errorf("step 4 mismatch: %+v", st.Steps[4])
 	}
 }
 

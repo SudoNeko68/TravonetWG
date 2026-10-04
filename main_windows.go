@@ -125,7 +125,7 @@ Modes:
 Options:
   -c, --config FILE             Load WireGuard configuration file (.conf)
   --socks, --socks5 [ADDR:PORT] Start userspace SOCKS5 proxy (default: 127.0.0.1:1080)
-  -s, --strategy DSL            Evasion pipeline DSL (default: "junk(64) -> fake_udp(148) -> frag(8) -> frag(148)")
+  -s, --strategy DSL            Evasion pipeline DSL (default: "fake(148) -> frag(8) -> frag(72) -> fake(148) -> frag(76)")
   --fake-ttl N|auto             TTL for fake packets (number 1-255 or 'auto' for hop distance probe)
   --pre-junk N                  Size in bytes of initial junk UDP packet (default: 64, 0 to disable)
   --no-evasion                  Disable all evasion mechanisms (run as standard wireguard-go)
