@@ -1,6 +1,6 @@
 # TravonetWG
 
-Клиентская реализация протокола WireGuard на базе wireguard-go с встроенным механизмом обхода глубокого анализа пакетов (DPI / ТСПУ) на уровнях L3 и L4. Работает с любыми стандартными немодифицированными серверами WireGuard (включая Cloudflare WARP, коммерческие VPN-провайдеры и стандартные серверы на Linux).
+Клиентская реализация протокола WireGuard на базе wireguard-go с встроенным механизмом обхода глубокого анализа пакетов (DPI / ТСПУ) на уровнях L3 и L4. Работает с любыми стандартными немодифицированными серверами WireGuard (включая коммерческие VPN-провайдеры и собственные серверы на Linux).
 
 ---
 
@@ -169,40 +169,39 @@ go build -o travonet-wg .
 
 ```bash
 # Запуск на стандартном адресе 127.0.0.1:1080 (без указания адреса):
-./travonet-wg -c warp.conf --socks
+./travonet-wg -c client.conf --socks
 
 # С указанием только порта:
-./travonet-wg -c warp.conf --socks 1088
+./travonet-wg -c client.conf --socks 1088
 
 # С указанием конкретного интерфейса и порта:
-./travonet-wg -c warp.conf --socks 0.0.0.0:1088
+./travonet-wg -c client.conf --socks 0.0.0.0:1088
 ```
 
 Проверка соединения через curl:
 ```bash
-curl -x socks5h://127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace
+curl -x socks5h://127.0.0.1:1080 https://ifconfig.me
 ```
-В выводе команды параметр `warp=on` подтверждает успешную передачу трафика через туннель.
 
-### 2. Запуск системного VPN через скрипт run_warp.sh (с правами root)
-Скрипт `run_warp.sh` автоматически настраивает системную маршрутизацию и DNS для направления всего интернет-трафика через туннель:
+### 2. Запуск системного VPN через скрипт run_tunnel.sh (с правами root)
+Скрипт `run_tunnel.sh` автоматически настраивает системную маршрутизацию и DNS для направления всего интернет-трафика через туннель:
 
 ```bash
 # Стандартный запуск с автоматическим подбором TTL:
-sudo ./run_warp.sh warp.conf
+sudo ./run_tunnel.sh client.conf
 
 # Запуск с указанием конкретного TTL для фейковых пакетов:
-sudo ./run_warp.sh warp.conf --fake-ttl 10
+sudo ./run_tunnel.sh client.conf --fake-ttl 10
 ```
 
 Проверка маршрутизации:
 ```bash
-curl https://cloudflare.com/cdn-cgi/trace
+curl https://ifconfig.me
 ```
 
 ### 3. Прямой запуск с созданием интерфейса tun (с правами root)
 ```bash
-sudo ./travonet-wg -f -c warp.conf warp
+sudo ./travonet-wg -f -c client.conf wg0
 ```
 
 ---

@@ -156,7 +156,7 @@ func ParseConfig(r io.Reader) (*Config, error) {
 
 	// Default PersistentKeepalive:
 	// WireGuard tunnels through NAT require periodic keepalives to prevent NAT state timeout.
-	// For Cloudflare WARP and typical router NATs, 25s can be too long, especially on port 500
+	// For WireGuard servers behind typical router NATs, 25s can be too long, especially on port 500
 	// where IPsec ALG / NAT helpers drop non-IPsec UDP states after 15-20 seconds.
 	if cfg.PersistentKeepalive <= 0 {
 		cfg.PersistentKeepalive = 10

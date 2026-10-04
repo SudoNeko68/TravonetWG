@@ -16,26 +16,26 @@
 Адрес и порт опциональны: если не указаны, используется 127.0.0.1:1080. Можно указать только порт (например, 1088) или полный адрес (0.0.0.0:1088).
 
 Команда для запуска со стандартной проверенной стратегией и подробным логом:
-  sudo ./travonet-wg -c warp.conf --socks -d
+  sudo ./travonet-wg -c client.conf --socks -d
 
 Команда с указанием кастомного порта:
-  sudo ./travonet-wg -c warp.conf --socks 1088 -d
+  sudo ./travonet-wg -c client.conf --socks 1088 -d
 
 Команда с явным указанием стратегии и автоматическим подбором TTL:
-  sudo ./travonet-wg -c warp.conf --socks 1080 -s "junk(64) -> fake_udp(148) -> frag(8) -> frag(148)" --fake-ttl auto -d
+  sudo ./travonet-wg -c client.conf --socks 1080 -s "junk(64) -> fake_udp(148) -> frag(8) -> frag(148)" --fake-ttl auto -d
 
 Команда с фиксированным TTL фейка (например, TTL=10 хопов):
-  sudo ./travonet-wg -c warp.conf --socks 1080 -s "junk(64) -> fake_udp(148) -> frag(8) -> frag(148)" --fake-ttl 10 -d
+  sudo ./travonet-wg -c client.conf --socks 1080 -s "junk(64) -> fake_udp(148) -> frag(8) -> frag(148)" --fake-ttl 10 -d
 
 Проверка работы SOCKS5 через curl (в соседнем терминале):
-  curl -x socks5h://127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace
-  (В выводе должно быть: warp=on)
+  curl -x socks5h://127.0.0.1:1080 https://ifconfig.me
+  (В ответе отобразится публичный IP-адрес WireGuard-сервера)
 
 Запуск без root (чистый userspace через setsockopt IP_TTL):
-  ./travonet-wg -c warp.conf --socks -d
+  ./travonet-wg -c client.conf --socks -d
 
 Запуск в качестве системного VPN (перенаправление всего интернета через TUN):
-  sudo ./run_warp.sh warp.conf
+  sudo ./run_tunnel.sh client.conf
 
 --------------------------------------------------------------------------------
 2. КАТАЛОГ СТРАТЕГИЙ (ПЕРЕДАЮТСЯ В АРГУМЕНТ -s ИЛИ --strategy)
