@@ -336,10 +336,10 @@ func ParseStrategy(dsl string, defaultFakeTTL, defaultNormalTTL int) (*Strategy,
 
 			steps = append(steps, step)
 
-		case "fake_udp", "fakeudp":
+		case "fake_udp", "fakeudp", "fake", "fake_packet":
 			step := Step{
 				Action: ActionFakeUDP,
-				Length: 64,
+				Length: WGHandshakeInitiationSize,
 				TTL:    defaultFakeTTL,
 			}
 			if szStr, ok := namedArgs["size"]; ok {
