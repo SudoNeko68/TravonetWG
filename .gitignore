@@ -1,3 +1,6 @@
 wireguard-go
 /travonet-wg
 *.test
+*.exe
+build/
+

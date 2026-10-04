@@ -15,7 +15,6 @@ import (
 	"net"
 	"net/netip"
 	"sync"
-	"syscall"
 	"time"
 )
 
@@ -27,6 +26,7 @@ const (
 	WGHandshakeInitiationSize = 148
 	UDPHeaderSize             = 8
 	DefaultPart1WGSize        = 80
+	ipProtoUDP                = 17
 )
 
 // EvasionConfig configures the evasion mechanism
@@ -95,11 +95,6 @@ func (b *EvasionBind) SetIPv4TTL(ttl int) error {
 	if ctrl, ok := b.Bind.(SocketTTLController); ok {
 		return ctrl.SetIPv4TTL(ttl)
 	}
-	if peeker, ok := b.Bind.(PeekLookAtSocketFd); ok {
-		if fd, err := peeker.PeekLookAtSocketFd4(); err == nil && fd >= 0 {
-			return syscall.SetsockoptInt(fd, syscall.IPPROTO_IP, syscall.IP_TTL, ttl)
-		}
-	}
 	return errors.New("underlying bind does not support setting TTL")
 }
 
@@ -136,31 +131,12 @@ func NewEvasionBind(base Bind, cfg EvasionConfig) *EvasionBind {
 	return b
 }
 
-func initRawSocket() (int, error) {
-	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_RAW)
-	if err != nil {
-		return -1, fmt.Errorf("syscall.Socket(AF_INET, SOCK_RAW, IPPROTO_RAW): %w", err)
-	}
-	if err := syscall.SetsockoptInt(fd, syscall.IPPROTO_IP, syscall.IP_HDRINCL, 1); err != nil {
-		syscall.Close(fd)
-		return -1, fmt.Errorf("setsockopt IP_HDRINCL: %w", err)
-	}
-	// IP_NODEFRAG tells kernel not to reassemble fragments on outgoing raw socket.
-	// We ignore errors here in case specific kernels or container namespaces don't permit it.
-	_ = syscall.SetsockoptInt(fd, syscall.IPPROTO_IP, IP_NODEFRAG, 1)
-
-	// IP_FREEBIND (15) allows binding/sending with non-local source addresses if needed.
-	_ = syscall.SetsockoptInt(fd, syscall.IPPROTO_IP, 15, 1)
-
-	return fd, nil
-}
-
 func (b *EvasionBind) ensureRawSocketLocked() (int, error) {
 	if b.rawFd >= 0 {
 		return b.rawFd, nil
 	}
 	if b.rawSocketAttempted {
-		return -1, syscall.EPERM
+		return -1, errors.New("permission denied for raw socket")
 	}
 	b.rawSocketAttempted = true
 	fd, err := initRawSocket()
@@ -235,7 +211,7 @@ func (b *EvasionBind) Close() error {
 	defer b.mu.Unlock()
 	b.closed = true
 	if b.rawFd >= 0 {
-		syscall.Close(b.rawFd)
+		_ = closeRawSocket(b.rawFd)
 		b.rawFd = -1
 	}
 	b.rawSocketAttempted = false
@@ -614,16 +590,6 @@ func (b *EvasionBind) sendObfuscatedHandshake(rawFd int, localPort int, ep Endpo
 	return nil
 }
 
-func sendRawPacket(rawFd int, dstIP []byte, packet []byte) error {
-	var addr syscall.SockaddrInet4
-	if len(dstIP) >= 4 {
-		copy(addr.Addr[:], dstIP[:4])
-	} else {
-		return fmt.Errorf("invalid IPv4 address length: %d", len(dstIP))
-	}
-	return syscall.Sendto(rawFd, packet, 0, &addr)
-}
-
 func buildIPv4Packet(srcIP, dstIP []byte, id uint16, ttl int, mf bool, offsetBytes int, payload []byte) []byte {
 	totalLen := 20 + len(payload)
 	pkt := make([]byte, totalLen)
@@ -641,7 +607,7 @@ func buildIPv4Packet(srcIP, dstIP []byte, id uint16, ttl int, mf bool, offsetByt
 	binary.BigEndian.PutUint16(pkt[6:8], flagsAndOffset)
 
 	pkt[8] = byte(ttl)
-	pkt[9] = syscall.IPPROTO_UDP
+	pkt[9] = ipProtoUDP
 	binary.BigEndian.PutUint16(pkt[10:12], 0)
 	copy(pkt[12:16], srcIP[:4])
 	copy(pkt[16:20], dstIP[:4])
@@ -675,7 +641,7 @@ func computeUDPChecksum(srcIP, dstIP []byte, udpHeader, payload []byte) uint16 {
 	sum += uint32(binary.BigEndian.Uint16(srcIP[2:4]))
 	sum += uint32(binary.BigEndian.Uint16(dstIP[0:2]))
 	sum += uint32(binary.BigEndian.Uint16(dstIP[2:4]))
-	sum += uint32(syscall.IPPROTO_UDP)
+	sum += uint32(ipProtoUDP)
 	totalUDPLen := uint16(len(udpHeader) + len(payload))
 	sum += uint32(totalUDPLen)
 
