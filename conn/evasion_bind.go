@@ -31,14 +31,15 @@ const (
 
 // EvasionConfig configures the evasion mechanism
 type EvasionConfig struct {
-	Enabled       bool   // Enable L3 fragmentation and fake TTL
-	FakeTTL       int    // TTL for the fake MF=0 terminating fragment (default: 3)
-	PreJunkSize   int    // Size in bytes of pre-junk UDP datagram (default: 64, 0 to disable)
-	PreJunkBadsum bool   // If true, uses corrupted UDP checksum on pre-junk
-	NormalTTL     int    // TTL for legitimate fragments (default: 64)
-	Strategy      string // DSL strategy pipeline (e.g. "junk(64) -> frag(8) -> ...")
-	Debug         bool   // Enable verbose evasion debugging logs
-	VerbosePacket bool   // Log every data packet
+	Enabled       bool                         // Enable L3 fragmentation and fake TTL
+	FakeTTL       int                          // TTL for the fake MF=0 terminating fragment (default: 3)
+	PreJunkSize   int                          // Size in bytes of pre-junk UDP datagram (default: 64, 0 to disable)
+	PreJunkBadsum bool                         // If true, uses corrupted UDP checksum on pre-junk
+	NormalTTL     int                          // TTL for legitimate fragments (default: 64)
+	Strategy      string                       // DSL strategy pipeline (e.g. "junk(64) -> frag(8) -> ...")
+	Debug         bool                         // Enable verbose evasion debugging logs
+	VerbosePacket bool                         // Log every data packet
+	LogFunc       func(string, ...interface{}) // Optional custom logger (e.g. for Android logcat)
 
 	compiledStrategy *Strategy
 }
@@ -65,6 +66,14 @@ type EvasionBind struct {
 	rawSocketAttempted bool
 	actualPort         uint16
 	closed             bool
+}
+
+func (b *EvasionBind) logf(format string, args ...interface{}) {
+	if b.cfg.LogFunc != nil {
+		b.cfg.LogFunc(format, args...)
+	} else {
+		fmt.Printf(format, args...)
+	}
 }
 
 var (
