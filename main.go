@@ -129,7 +129,8 @@ Options:
   --pre-junk N                  Size in bytes of initial junk UDP packet (default: 64, 0 to disable)
   --no-evasion                  Disable all evasion mechanisms (run as standard wireguard-go)
   -d, --debug                   Enable verbose debug logging
-  -f, --foreground              Run in foreground instead of daemonizing
+  -D, --daemon                  Run in background as daemon (default: foreground)
+  -f, --foreground              Run in foreground (default)
   -h, --help                    Show this help message
   --version                     Show version information
 `, os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0])
@@ -161,7 +162,7 @@ func main() {
 
 	warning()
 
-	var foreground bool
+	var daemonize bool
 	var debug bool
 	var configFile string
 	var interfaceName string
@@ -192,8 +193,10 @@ func main() {
 		case "-h", "--help", "-help":
 			printUsage()
 			return
+		case "-D", "--daemon", "-daemon":
+			daemonize = true
 		case "-f", "--foreground":
-			foreground = true
+			daemonize = false
 		case "-d", "--debug", "-debug":
 			debug = true
 		case "--no-evasion":
@@ -355,8 +358,11 @@ func main() {
 		}
 	}
 
-	if !foreground {
-		foreground = os.Getenv(ENV_WG_PROCESS_FOREGROUND) == "1"
+	if os.Getenv(ENV_WG_PROCESS_FOREGROUND) == "1" {
+		daemonize = false
+	}
+	if os.Getenv("WG_DAEMON") == "1" || os.Getenv("TRAVONET_DAEMON") == "1" {
+		daemonize = true
 	}
 
 	evasionCfg.Debug = debug
@@ -444,7 +450,7 @@ func main() {
 	}
 	// daemonize the process
 
-	if !foreground {
+	if daemonize {
 		env := os.Environ()
 		env = append(env, fmt.Sprintf("%s=3", ENV_WG_TUN_FD))
 		env = append(env, fmt.Sprintf("%s=4", ENV_WG_UAPI_FD))
