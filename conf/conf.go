@@ -38,6 +38,7 @@ type Config struct {
 	FakeTTL     int
 	PreJunkSize int
 	Socks5      string
+	SocksAuth   string
 
 	// [Peer] list
 	Peers []PeerConfig
@@ -148,6 +149,8 @@ func ParseConfig(r io.Reader) (*Config, error) {
 				}
 			case "socks5", "socks", "socks_proxy", "socks5_proxy":
 				cfg.Socks5 = val
+			case "socksauth", "socks_auth", "socks-auth":
+				cfg.SocksAuth = val
 			}
 
 		case "peer":

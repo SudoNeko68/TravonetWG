@@ -373,7 +373,11 @@ func wgStartSocks5(listenAddr string, settings string) int32 {
 	var localIPs []netip.Addr
 	var dnsIPs []netip.Addr
 	mtu := 1280
+	var socksAuth string
 	if parsed, err := conf.ParseConfigString(settings); err == nil {
+		if parsed.SocksAuth != "" {
+			socksAuth = parsed.SocksAuth
+		}
 		for _, a := range parsed.Addresses {
 			addrStr := a
 			if idx := strings.Index(addrStr, "/"); idx > 0 {
@@ -423,6 +427,14 @@ func wgStartSocks5(listenAddr string, settings string) int32 {
 
 	socksServer := proxy.NewSOCKS5Server(listenAddr, tnet.DialContext)
 	socksServer.Debug = true
+	if socksAuth != "" {
+		if user, pass, ok := strings.Cut(socksAuth, ":"); ok {
+			socksServer.SetAuth(user, pass)
+			logger.Verbosef("SOCKS5 authentication enabled for user '%s'", user)
+		} else {
+			logger.Errorf("Invalid SocksAuth format: %s (expected USER:PASS)", socksAuth)
+		}
+	}
 
 	go func() {
 		if err := socksServer.ListenAndServe(); err != nil && !strings.Contains(err.Error(), "closed") {

@@ -8,11 +8,17 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$SCRIPT_DIR"
-OUT_DIR="${PROJECT_ROOT}/build/android/jniLibs"
+OUT_DIR="${1:-${OUT_DIR:-${PROJECT_ROOT}/build/android/jniLibs}}"
 
 # Detect Go
-GO_BIN="${GO_BIN:-$(which go 2>/dev/null || echo "$HOME/.local/go/bin/go")}"
-if [ ! -x "$GO_BIN" ]; then
+if [ -z "${GO_BIN:-}" ]; then
+    if [ -x "$HOME/.local/go/bin/go" ]; then
+        GO_BIN="$HOME/.local/go/bin/go"
+    else
+        GO_BIN="$(which go 2>/dev/null || echo "go")"
+    fi
+fi
+if ! command -v "$GO_BIN" >/dev/null 2>&1 && [ ! -x "$GO_BIN" ]; then
     echo "Error: Go binary not found at '$GO_BIN'. Please install Go or set GO_BIN." >&2
     exit 1
 fi
@@ -21,6 +27,7 @@ fi
 if [ -z "${ANDROID_NDK_HOME:-}" ] && [ -z "${ANDROID_NDK_ROOT:-}" ]; then
     for cand in \
         "$HOME/Android/Sdk/ndk/"* \
+        "$HOME/Android/Sdk/ndk-bundle" \
         "/opt/android-sdk/ndk/"* \
         "/opt/android-ndk/"* \
         "${ANDROID_HOME:-}/ndk/"*; do

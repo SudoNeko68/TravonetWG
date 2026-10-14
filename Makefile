@@ -28,4 +28,7 @@ test:
 clean:
 	rm -f wireguard-go
 
-.PHONY: all clean test install generate-version-and-build
+android:
+	./build-android.sh
+
+.PHONY: all clean test install generate-version-and-build android
