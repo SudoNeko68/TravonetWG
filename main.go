@@ -124,6 +124,7 @@ Modes:
 Options:
   -c, --config FILE             Load WireGuard configuration file (.conf)
   --socks, --socks5 [ADDR:PORT] Start userspace SOCKS5 proxy (default: 127.0.0.1:1080)
+  --socks-auth USER:PASS        Enable RFC 1929 username/password auth for SOCKS5 proxy
   -s, --strategy DSL            Evasion pipeline DSL (default: "fake(148) -> frag(8) -> frag(72) -> fake(148) -> frag(76)")
   --fake-ttl N|auto             TTL for fake packets (number 1-255 or 'auto' for hop distance probe)
   --pre-junk N                  Size in bytes of initial junk UDP packet (default: 64, 0 to disable)
@@ -187,6 +188,7 @@ func main() {
 	var cliStrategy string
 	var cliPreJunk int = -1
 	var cliSocks5 string
+	var cliSocksAuth string
 
 	for i := 1; i < len(os.Args); i++ {
 		arg := os.Args[i]
@@ -209,6 +211,11 @@ func main() {
 			if i+1 < len(os.Args) {
 				i++
 				configFile = os.Args[i]
+			}
+		case "--socks-auth", "-socks-auth":
+			if i+1 < len(os.Args) {
+				i++
+				cliSocksAuth = os.Args[i]
 			}
 		case "--socks5", "-socks5", "--socks", "-socks":
 			cliSocks5 = "127.0.0.1:1080"
@@ -240,6 +247,10 @@ func main() {
 				}
 			}
 		default:
+			if strings.HasPrefix(arg, "--socks-auth=") || strings.HasPrefix(arg, "-socks-auth=") {
+				cliSocksAuth = arg[strings.Index(arg, "=")+1:]
+				continue
+			}
 			if strings.HasPrefix(arg, "--socks5=") || strings.HasPrefix(arg, "-socks5=") ||
 				strings.HasPrefix(arg, "--socks=") || strings.HasPrefix(arg, "-socks=") {
 				val := arg[strings.Index(arg, "=")+1:]
@@ -346,7 +357,7 @@ func main() {
 			return
 		}
 
-		runSocks5Userspace(socks5Addr, parsedConfig, evasionCfg, debug)
+		runSocks5Userspace(socks5Addr, cliSocksAuth, parsedConfig, evasionCfg, debug)
 		return
 	}
 
@@ -582,7 +593,7 @@ func main() {
 	logger.Verbosef("Shutting down")
 }
 
-func runSocks5Userspace(socks5Addr string, parsedConfig *conf.Config, evasionCfg conn.EvasionConfig, debug bool) {
+func runSocks5Userspace(socks5Addr string, socksAuth string, parsedConfig *conf.Config, evasionCfg conn.EvasionConfig, debug bool) {
 	// 1. Validate strategy if specified
 	if evasionCfg.Strategy != "" && evasionCfg.Strategy != "default" {
 		if _, err := conn.ParseStrategy(evasionCfg.Strategy, evasionCfg.FakeTTL, evasionCfg.NormalTTL); err != nil {
@@ -665,6 +676,13 @@ func runSocks5Userspace(socks5Addr string, parsedConfig *conf.Config, evasionCfg
 	// 6. Start SOCKS5 Server
 	socksServer := proxy.NewSOCKS5Server(socks5Addr, tnet.DialContext)
 	socksServer.Debug = debug
+	if socksAuth != "" {
+		if user, pass, ok := strings.Cut(socksAuth, ":"); ok {
+			socksServer.SetAuth(user, pass)
+		} else {
+			fmt.Fprintf(os.Stderr, "Warning: invalid socks-auth format %q (expected USER:PASS)\n", socksAuth)
+		}
+	}
 
 	fmt.Println("┌──────────────────────────────────────────────────────────────┐")
 	fmt.Println("│                                                              │")
@@ -672,13 +690,15 @@ func runSocks5Userspace(socks5Addr string, parsedConfig *conf.Config, evasionCfg
 	fmt.Println("│   Zero-Root / Pure Userspace Mode (gVisor Netstack)          │")
 	fmt.Println("│                                                              │")
 	fmt.Println("└──────────────────────────────────────────────────────────────┘")
-	if unsafe, reason := isNonLoopbackAddress(socks5Addr); unsafe {
+	if socksServer.Username != "" {
+		fmt.Printf("🔒 SOCKS5 Authentication:    Enabled (User: %s)\n", socksServer.Username)
+	} else if unsafe, reason := isNonLoopbackAddress(socks5Addr); unsafe {
 		fmt.Fprintln(os.Stderr, "════════════════════════════════════════════════════════════════")
 		fmt.Fprintln(os.Stderr, "[!] ВНИМАНИЕ: НЕБЕЗОПАСНАЯ КОНФИГУРАЦИЯ СЕТИ (SECURITY WARNING)!")
 		fmt.Fprintf(os.Stderr, "    %s.\n", reason)
 		fmt.Fprintln(os.Stderr, "    SOCKS5-прокси работает БЕЗ пароля и авторизации.")
 		fmt.Fprintln(os.Stderr, "    Любой узел сети может использовать этот туннель (Open Proxy).")
-		fmt.Fprintln(os.Stderr, "    Для безопасности привязывайте к 127.0.0.1 (только этот ПК).")
+		fmt.Fprintln(os.Stderr, "    Для защиты используйте --socks-auth USER:PASS или привязку к 127.0.0.1.")
 		fmt.Fprintln(os.Stderr, "════════════════════════════════════════════════════════════════")
 	}
 	fmt.Printf("🚀 SOCKS5 Proxy Listening on: %s\n", socks5Addr)

@@ -112,3 +112,79 @@ func TestSOCKS5Server(t *testing.T) {
 		t.Errorf("echo mismatch: got %q, want %q", string(buf), string(msg))
 	}
 }
+
+func TestSOCKS5ServerAuth(t *testing.T) {
+	echoListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen echo: %v", err)
+	}
+	defer echoListener.Close()
+
+	go func() {
+		for {
+			conn, err := echoListener.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				io.Copy(c, c)
+			}(conn)
+		}
+	}()
+
+	dialer := &net.Dialer{Timeout: 5 * time.Second}
+	srv := NewSOCKS5Server("127.0.0.1:0", dialer.DialContext)
+	srv.SetAuth("admin", "secret123")
+
+	go func() {
+		_ = srv.ListenAndServe()
+	}()
+	defer srv.Close()
+
+	var srvAddr net.Addr
+	for i := 0; i < 20; i++ {
+		srvAddr = srv.Addr()
+		if srvAddr != nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// 1. Test rejected when sending NO AUTH
+	conn1, err := net.Dial("tcp", srvAddr.String())
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	defer conn1.Close()
+
+	_, _ = conn1.Write([]byte{0x05, 0x01, 0x00}) // only NO AUTH method
+	resp1 := make([]byte, 2)
+	_, _ = io.ReadFull(conn1, resp1)
+	if resp1[1] != 0xFF {
+		t.Errorf("expected 0xFF (no acceptable method), got 0x%02x", resp1[1])
+	}
+
+	// 2. Test successful auth with correct credentials
+	conn2, err := net.Dial("tcp", srvAddr.String())
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	defer conn2.Close()
+
+	_, _ = conn2.Write([]byte{0x05, 0x01, 0x02}) // Method 0x02 (User/Pass)
+	resp2 := make([]byte, 2)
+	_, _ = io.ReadFull(conn2, resp2)
+	if resp2[1] != 0x02 {
+		t.Fatalf("expected 0x02 method chosen, got 0x%02x", resp2[1])
+	}
+
+	// Send RFC 1929 subnegotiation: VER 0x01 | ULEN 5 | "admin" | PLEN 9 | "secret123"
+	authPayload := []byte{0x01, 0x05, 'a', 'd', 'm', 'i', 'n', 0x09, 's', 'e', 'c', 'r', 'e', 't', '1', '2', '3'}
+	_, _ = conn2.Write(authPayload)
+	authResp := make([]byte, 2)
+	_, _ = io.ReadFull(conn2, authResp)
+	if authResp[1] != 0x00 {
+		t.Fatalf("expected auth success 0x00, got 0x%02x", authResp[1])
+	}
+}

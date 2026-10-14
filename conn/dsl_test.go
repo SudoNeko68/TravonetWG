@@ -132,3 +132,30 @@ func TestParseFakeFragMF1(t *testing.T) {
 		t.Errorf("frag step error: %+v", st.Steps[2])
 	}
 }
+
+func TestParseStrategyAliases(t *testing.T) {
+	cases := []struct {
+		input     string
+		stepCount int
+		firstAct  ActionType
+	}{
+		{"fake,ipfrag2", 3, ActionFakeUDP},
+		{"fake,split2", 3, ActionFakeUDP},
+		{"ipfrag2", 2, ActionFrag},
+		{"split2", 2, ActionFrag},
+		{"fake", 1, ActionFakeUDP},
+	}
+
+	for _, tc := range cases {
+		st, err := ParseStrategy(tc.input, 11, 64)
+		if err != nil {
+			t.Fatalf("failed to parse alias %s: %v", tc.input, err)
+		}
+		if len(st.Steps) != tc.stepCount {
+			t.Errorf("alias %s: expected %d steps, got %d", tc.input, tc.stepCount, len(st.Steps))
+		}
+		if st.Steps[0].Action != tc.firstAct {
+			t.Errorf("alias %s: expected first action %v, got %v", tc.input, tc.firstAct, st.Steps[0].Action)
+		}
+	}
+}

@@ -84,28 +84,43 @@ func (c *Config) ApplyNetworkConfig(iface string) error {
 
 // ApplyRoutes configures Windows routing table for AllowedIPs
 func (c *Config) ApplyRoutes(iface string) error {
-	if len(c.AllowedIPs) == 0 {
-		return nil
+	peers := c.Peers
+	if len(peers) == 0 && c.PublicKey != "" {
+		peers = []PeerConfig{{
+			PublicKey:  c.PublicKey,
+			Endpoint:   c.Endpoint,
+			AllowedIPs: c.AllowedIPs,
+		}}
 	}
 
-	// Prevent routing loops for Endpoint
-	if c.Endpoint != "" {
-		endpointHost := c.Endpoint
-		if h, _, err := net.SplitHostPort(c.Endpoint); err == nil {
-			endpointHost = h
-		}
-		ips, err := net.LookupIP(endpointHost)
-		if err == nil && len(ips) > 0 {
-			for _, ip := range ips {
-				if ip4 := ip.To4(); ip4 != nil {
-					_ = exec.Command("route", "add", ip4.String(), "mask", "255.255.255.255", "0.0.0.0", "metric", "1").Run()
+	// Prevent routing loops for Endpoints
+	for _, peer := range peers {
+		if peer.Endpoint != "" {
+			endpointHost := peer.Endpoint
+			if h, _, err := net.SplitHostPort(peer.Endpoint); err == nil {
+				endpointHost = h
+			}
+			ips, err := net.LookupIP(endpointHost)
+			if err == nil && len(ips) > 0 {
+				for _, ip := range ips {
+					if ip4 := ip.To4(); ip4 != nil {
+						_ = exec.Command("route", "add", ip4.String(), "mask", "255.255.255.255", "0.0.0.0", "metric", "1").Run()
+					}
 				}
 			}
 		}
 	}
 
-	// Add routes for AllowedIPs
-	for _, aip := range c.AllowedIPs {
+	// Add routes for AllowedIPs across all peers
+	var allAllowedIPs []string
+	for _, peer := range peers {
+		allAllowedIPs = append(allAllowedIPs, peer.AllowedIPs...)
+	}
+	if len(allAllowedIPs) == 0 {
+		allAllowedIPs = c.AllowedIPs
+	}
+
+	for _, aip := range allAllowedIPs {
 		aip = strings.TrimSpace(aip)
 		if aip == "" {
 			continue
@@ -130,22 +145,41 @@ func (c *Config) ApplyRoutes(iface string) error {
 
 // CleanupRoutes removes added routes on Windows
 func (c *Config) CleanupRoutes(iface string) {
-	if c.Endpoint != "" {
-		endpointHost := c.Endpoint
-		if h, _, err := net.SplitHostPort(c.Endpoint); err == nil {
-			endpointHost = h
-		}
-		ips, err := net.LookupIP(endpointHost)
-		if err == nil {
-			for _, ip := range ips {
-				if ip4 := ip.To4(); ip4 != nil {
-					_ = exec.Command("route", "delete", ip4.String()).Run()
+	peers := c.Peers
+	if len(peers) == 0 && c.PublicKey != "" {
+		peers = []PeerConfig{{
+			PublicKey:  c.PublicKey,
+			Endpoint:   c.Endpoint,
+			AllowedIPs: c.AllowedIPs,
+		}}
+	}
+
+	for _, peer := range peers {
+		if peer.Endpoint != "" {
+			endpointHost := peer.Endpoint
+			if h, _, err := net.SplitHostPort(peer.Endpoint); err == nil {
+				endpointHost = h
+			}
+			ips, err := net.LookupIP(endpointHost)
+			if err == nil {
+				for _, ip := range ips {
+					if ip4 := ip.To4(); ip4 != nil {
+						_ = exec.Command("route", "delete", ip4.String()).Run()
+					}
 				}
 			}
 		}
 	}
 
-	for _, aip := range c.AllowedIPs {
+	var allAllowedIPs []string
+	for _, peer := range peers {
+		allAllowedIPs = append(allAllowedIPs, peer.AllowedIPs...)
+	}
+	if len(allAllowedIPs) == 0 {
+		allAllowedIPs = c.AllowedIPs
+	}
+
+	for _, aip := range allAllowedIPs {
 		aip = strings.TrimSpace(aip)
 		if aip == "0.0.0.0/0" {
 			_ = exec.Command("netsh", "interface", "ipv4", "delete", "route", "0.0.0.0/1", fmt.Sprintf("interface=%s", iface)).Run()

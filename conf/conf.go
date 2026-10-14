@@ -17,6 +17,14 @@ import (
 	"strings"
 )
 
+type PeerConfig struct {
+	PublicKey           string
+	PresharedKey        string
+	Endpoint            string
+	AllowedIPs          []string
+	PersistentKeepalive int
+}
+
 type Config struct {
 	// [Interface]
 	PrivateKey string
@@ -31,7 +39,10 @@ type Config struct {
 	PreJunkSize int
 	Socks5      string
 
-	// [Peer]
+	// [Peer] list
+	Peers []PeerConfig
+
+	// Backward-compatibility shortcuts for primary peer
 	PublicKey           string
 	Endpoint            string
 	AllowedIPs          []string
@@ -61,6 +72,8 @@ func ParseConfig(r io.Reader) (*Config, error) {
 
 	scanner := bufio.NewScanner(r)
 	currentSection := ""
+	var peers []PeerConfig
+	var curPeer *PeerConfig
 
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -70,7 +83,15 @@ func ParseConfig(r io.Reader) (*Config, error) {
 		}
 
 		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
-			currentSection = strings.ToLower(line[1 : len(line)-1])
+			newSection := strings.ToLower(line[1 : len(line)-1])
+			if currentSection == "peer" && curPeer != nil {
+				peers = append(peers, *curPeer)
+				curPeer = nil
+			}
+			if newSection == "peer" {
+				curPeer = &PeerConfig{}
+			}
+			currentSection = newSection
 			continue
 		}
 
@@ -130,39 +151,65 @@ func ParseConfig(r io.Reader) (*Config, error) {
 			}
 
 		case "peer":
+			if curPeer == nil {
+				curPeer = &PeerConfig{}
+			}
 			switch key {
 			case "publickey":
-				cfg.PublicKey = val
+				curPeer.PublicKey = val
+			case "presharedkey", "preshared_key":
+				curPeer.PresharedKey = val
 			case "endpoint":
-				cfg.Endpoint = val
+				curPeer.Endpoint = val
 			case "allowedips":
 				for _, ip := range strings.Split(val, ",") {
 					i := strings.TrimSpace(ip)
 					if i != "" {
-						cfg.AllowedIPs = append(cfg.AllowedIPs, i)
+						curPeer.AllowedIPs = append(curPeer.AllowedIPs, i)
 					}
 				}
 			case "persistentkeepalive", "persistent_keepalive", "persistent-keepalive", "persistentkeepaliveinterval", "persistent_keepalive_interval":
 				if pka, err := strconv.Atoi(val); err == nil && pka > 0 {
-					cfg.PersistentKeepalive = pka
+					curPeer.PersistentKeepalive = pka
 				}
 			}
 		}
+	}
+
+	if currentSection == "peer" && curPeer != nil {
+		peers = append(peers, *curPeer)
+		curPeer = nil
 	}
 
 	if err := scanner.Err(); err != nil {
 		return nil, fmt.Errorf("error reading config: %w", err)
 	}
 
-	// Default PersistentKeepalive:
-	// WireGuard tunnels through NAT require periodic keepalives to prevent NAT state timeout.
-	// For WireGuard servers behind typical router NATs, 25s can be too long, especially on port 500
-	// where IPsec ALG / NAT helpers drop non-IPsec UDP states after 15-20 seconds.
-	if cfg.PersistentKeepalive <= 0 {
-		cfg.PersistentKeepalive = 10
+	for i := range peers {
+		if peers[i].PersistentKeepalive <= 0 {
+			if cfg.PersistentKeepalive > 0 {
+				peers[i].PersistentKeepalive = cfg.PersistentKeepalive
+			} else {
+				peers[i].PersistentKeepalive = 10
+			}
+		}
+		if IsPort500Endpoint(peers[i].Endpoint) && peers[i].PersistentKeepalive > 10 {
+			peers[i].PersistentKeepalive = 5
+		}
 	}
-	if IsPort500Endpoint(cfg.Endpoint) && cfg.PersistentKeepalive > 10 {
-		cfg.PersistentKeepalive = 5
+	cfg.Peers = peers
+	if len(peers) > 0 {
+		cfg.PublicKey = peers[0].PublicKey
+		cfg.Endpoint = peers[0].Endpoint
+		cfg.AllowedIPs = peers[0].AllowedIPs
+		cfg.PersistentKeepalive = peers[0].PersistentKeepalive
+	} else {
+		if cfg.PersistentKeepalive <= 0 {
+			cfg.PersistentKeepalive = 10
+		}
+		if IsPort500Endpoint(cfg.Endpoint) && cfg.PersistentKeepalive > 10 {
+			cfg.PersistentKeepalive = 5
+		}
 	}
 
 	return cfg, nil
@@ -195,29 +242,50 @@ func (c *Config) ToUAPI() (string, error) {
 		sb.WriteString(fmt.Sprintf("listen_port=%d\n", c.ListenPort))
 	}
 
-	// Peer section
-	if c.PublicKey != "" {
-		pubBytes, err := base64.StdEncoding.DecodeString(c.PublicKey)
-		if err != nil || len(pubBytes) != 32 {
-			return "", fmt.Errorf("invalid PublicKey (must be 32-byte base64): %v", err)
-		}
+	peers := c.Peers
+	if len(peers) == 0 && c.PublicKey != "" {
+		peers = []PeerConfig{{
+			PublicKey:           c.PublicKey,
+			Endpoint:            c.Endpoint,
+			AllowedIPs:          c.AllowedIPs,
+			PersistentKeepalive: c.PersistentKeepalive,
+		}}
+	}
 
+	if len(peers) > 0 {
 		sb.WriteString("replace_peers=true\n")
-		sb.WriteString(fmt.Sprintf("public_key=%s\n", hex.EncodeToString(pubBytes)))
-
-		if c.Endpoint != "" {
-			sb.WriteString(fmt.Sprintf("endpoint=%s\n", c.Endpoint))
-		}
-
-		if len(c.AllowedIPs) > 0 {
-			sb.WriteString("replace_allowed_ips=true\n")
-			for _, aip := range c.AllowedIPs {
-				sb.WriteString(fmt.Sprintf("allowed_ip=%s\n", aip))
+		for _, peer := range peers {
+			if peer.PublicKey == "" {
+				continue
 			}
-		}
+			pubBytes, err := base64.StdEncoding.DecodeString(peer.PublicKey)
+			if err != nil || len(pubBytes) != 32 {
+				return "", fmt.Errorf("invalid PublicKey (must be 32-byte base64): %v", err)
+			}
+			sb.WriteString(fmt.Sprintf("public_key=%s\n", hex.EncodeToString(pubBytes)))
 
-		if c.PersistentKeepalive > 0 {
-			sb.WriteString(fmt.Sprintf("persistent_keepalive_interval=%d\n", c.PersistentKeepalive))
+			if peer.PresharedKey != "" {
+				pskBytes, err := base64.StdEncoding.DecodeString(peer.PresharedKey)
+				if err != nil || len(pskBytes) != 32 {
+					return "", fmt.Errorf("invalid PresharedKey (must be 32-byte base64): %v", err)
+				}
+				sb.WriteString(fmt.Sprintf("preshared_key=%s\n", hex.EncodeToString(pskBytes)))
+			}
+
+			if peer.Endpoint != "" {
+				sb.WriteString(fmt.Sprintf("endpoint=%s\n", peer.Endpoint))
+			}
+
+			if len(peer.AllowedIPs) > 0 {
+				sb.WriteString("replace_allowed_ips=true\n")
+				for _, aip := range peer.AllowedIPs {
+					sb.WriteString(fmt.Sprintf("allowed_ip=%s\n", aip))
+				}
+			}
+
+			if peer.PersistentKeepalive > 0 {
+				sb.WriteString(fmt.Sprintf("persistent_keepalive_interval=%d\n", peer.PersistentKeepalive))
+			}
 		}
 	}
 

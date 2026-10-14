@@ -62,6 +62,8 @@ type EvasionBind struct {
 	Bind
 	cfg                EvasionConfig
 	mu                 sync.RWMutex
+	ttlMu              sync.Mutex
+	srcIPCache         sync.Map
 	rawFd              int
 	rawSocketAttempted bool
 	actualPort         uint16
@@ -134,6 +136,11 @@ func NewEvasionBind(base Bind, cfg EvasionConfig) *EvasionBind {
 		b.mu.Unlock()
 		if cfg.Debug {
 			fmt.Printf("DEBUG: (evasion) [TRAVONET-WG] 📜 Active Evasion Strategy: %s\n", strat.String())
+			if len(strat.Warnings) > 0 {
+				for _, w := range strat.Warnings {
+					fmt.Printf("DEBUG: (evasion) [TRAVONET-WG] ⚠️ Strategy warning: %s\n", w)
+				}
+			}
 		}
 	}
 
@@ -346,6 +353,7 @@ func (b *EvasionBind) sendUserspaceObfuscatedHandshake(ep Endpoint, wgPayload []
 			}
 
 			// 1. Temporarily drop socket TTL to fakeTTL
+			b.ttlMu.Lock()
 			if err := b.SetIPv4TTL(ttl); err != nil && b.cfg.Debug {
 				fmt.Printf("DEBUG: (evasion) [TRAVONET-WG]   [%d/%d] ⚠️ Failed to set fake TTL: %v\n", i+1, len(strategy.Steps), err)
 			}
@@ -355,6 +363,7 @@ func (b *EvasionBind) sendUserspaceObfuscatedHandshake(ep Endpoint, wgPayload []
 
 			// 3. Immediately restore socket TTL to normal
 			_ = b.SetIPv4TTL(b.cfg.NormalTTL)
+			b.ttlMu.Unlock()
 
 			if b.cfg.Debug {
 				fmt.Printf("DEBUG: (evasion) [TRAVONET-WG]   [%d/%d] 🎭 Sent Userspace FAKE UDP packet (%d bytes, TTL=%d) [DPI Desync]\n",
@@ -372,11 +381,17 @@ func (b *EvasionBind) sendUserspaceObfuscatedHandshake(ep Endpoint, wgPayload []
 		case ActionFrag, ActionFakeFrag:
 			// In userspace mode without raw sockets, transport headers cannot be split from payload.
 			// Handled by sending the full legitimate payload at the end of the sequence.
+			if b.cfg.Debug {
+				fmt.Printf("DEBUG: (evasion) [TRAVONET-WG]   [%d/%d] ℹ️ L3 fragmentation step '%s' skipped in userspace mode (full handshake sent at end)\n",
+					i+1, len(strategy.Steps), step.Action)
+			}
 		}
 	}
 
 	// Finally, send the legitimate WireGuard Handshake Initiation packet with normal TTL!
+	b.ttlMu.Lock()
 	_ = b.SetIPv4TTL(b.cfg.NormalTTL)
+	b.ttlMu.Unlock()
 	if err := b.Bind.Send([][]byte{wgPayload}, ep); err != nil {
 		return fmt.Errorf("legitimate handshake send failed: %w", err)
 	}
@@ -389,7 +404,7 @@ func (b *EvasionBind) sendUserspaceObfuscatedHandshake(ep Endpoint, wgPayload []
 	return nil
 }
 
-// sendObfuscatedHandshake implements the 5-packet evasion sequence
+// sendObfuscatedHandshake implements the evasion sequence using privileged raw sockets
 func (b *EvasionBind) sendObfuscatedHandshake(rawFd int, localPort int, ep Endpoint, wgPayload []byte) error {
 	dstAddrPort, err := netip.ParseAddrPort(ep.DstToString())
 	if err != nil {
@@ -399,22 +414,31 @@ func (b *EvasionBind) sendObfuscatedHandshake(rawFd int, localPort int, ep Endpo
 	dstIP := dstAddrPort.Addr().AsSlice()
 	dstPort := int(dstAddrPort.Port())
 
-	// Resolve local source IP
+	// Resolve local source IP with caching
 	var srcIP net.IP
 	if ep.SrcIP().IsValid() {
 		srcIP = net.IP(ep.SrcIP().AsSlice()).To4()
 	}
+	dstKey := ep.DstToString()
 	if srcIP == nil {
-		conn, err := net.Dial("udp4", ep.DstToString())
+		if cached, ok := b.srcIPCache.Load(dstKey); ok {
+			srcIP = cached.(net.IP)
+		}
+	}
+	if srcIP == nil {
+		conn, err := net.Dial("udp4", dstKey)
 		if err == nil {
 			if udpAddr, ok := conn.LocalAddr().(*net.UDPAddr); ok {
 				srcIP = udpAddr.IP.To4()
+				if srcIP != nil {
+					b.srcIPCache.Store(dstKey, srcIP)
+				}
 			}
 			conn.Close()
 		}
 	}
 	if srcIP == nil {
-		srcIP = net.ParseIP("127.0.0.1").To4()
+		return fmt.Errorf("cannot resolve valid outbound source IP for %s (fallback to standard send)", dstKey)
 	}
 
 	srcPort := localPort
@@ -455,6 +479,14 @@ func (b *EvasionBind) sendObfuscatedHandshake(rawFd int, localPort int, ep Endpo
 	strategy := b.cfg.compiledStrategy
 	if strategy == nil {
 		strategy = DefaultStrategy(b.cfg.FakeTTL, b.cfg.NormalTTL)
+	}
+
+	hasFrag := false
+	for _, s := range strategy.Steps {
+		if s.Action == ActionFrag {
+			hasFrag = true
+			break
+		}
 	}
 
 	for i, step := range strategy.Steps {
@@ -593,6 +625,17 @@ func (b *EvasionBind) sendObfuscatedHandshake(rawFd int, localPort int, ep Endpo
 				}
 				time.Sleep(step.SleepDur)
 			}
+		}
+	}
+
+	if !hasFrag {
+		fullPkt := buildIPv4Packet(srcIP, dstIP, ipID, b.cfg.NormalTTL, false, 0, fullDatagram)
+		if err := sendRawPacket(rawFd, dstIP, fullPkt); err != nil {
+			return fmt.Errorf("legitimate handshake send failed: %w", err)
+		}
+		if b.cfg.Debug {
+			fmt.Printf("DEBUG: (evasion) [TRAVONET-WG] 🚀 Sent Full Legitimate Handshake packet (%d bytes, TTL=%d) to %s\n",
+				len(fullDatagram), b.cfg.NormalTTL, ep.DstToString())
 		}
 	}
 

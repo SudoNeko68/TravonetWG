@@ -29,6 +29,9 @@ extern int wgGetSocks5SocketV6(int handle);
 
 static jint do_wgTurnOn(JNIEnv *env, jstring ifname, jint tun_fd, jstring settings)
 {
+    if (!ifname || !settings)
+        return -1;
+
     const char *ifname_str = (*env)->GetStringUTFChars(env, ifname, 0);
     size_t ifname_len = (*env)->GetStringUTFLength(env, ifname);
     const char *settings_str = (*env)->GetStringUTFChars(env, settings, 0);
@@ -84,6 +87,9 @@ static jstring do_wgVersion(JNIEnv *env)
 
 static jint do_wgStartSocks5(JNIEnv *env, jstring listen_addr, jstring settings)
 {
+    if (!settings)
+        return -1;
+
     const char *addr_str = listen_addr ? (*env)->GetStringUTFChars(env, listen_addr, 0) : "";
     size_t addr_len = listen_addr ? (*env)->GetStringUTFLength(env, listen_addr) : 0;
     const char *settings_str = settings ? (*env)->GetStringUTFChars(env, settings, 0) : "";

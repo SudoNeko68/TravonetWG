@@ -13,6 +13,7 @@ import (
 	"net"
 	"os/exec"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -48,19 +49,32 @@ func MeasureTargetTTL(endpoint string) (totalHops int, recommendedFakeTTL int, e
 
 	targetIPStr := ip.String()
 
-	// Check if traceroute binary exists
-	traceroutePath, err := exec.LookPath("traceroute")
-	if err != nil {
-		return 0, 10, fmt.Errorf("traceroute utility not found in PATH")
-	}
-
+	// Probe using platform-specific traceroute tool
+	var cmd *exec.Cmd
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, traceroutePath, "-q", "1", "-w", "1", "-m", "22", "-n", targetIPStr)
+	if runtime.GOOS == "windows" {
+		tracertPath, err := exec.LookPath("tracert")
+		if err == nil {
+			cmd = exec.CommandContext(ctx, tracertPath, "-d", "-h", "22", "-w", "1000", targetIPStr)
+		}
+	} else {
+		if trPath, err := exec.LookPath("traceroute"); err == nil {
+			cmd = exec.CommandContext(ctx, trPath, "-q", "1", "-w", "1", "-m", "22", "-n", targetIPStr)
+		} else if tpPath, err := exec.LookPath("tracepath"); err == nil {
+			cmd = exec.CommandContext(ctx, tpPath, "-m", "22", "-n", targetIPStr)
+		}
+	}
+
+	if cmd == nil {
+		// No traceroute tool found on system; fallback to safe default for DPI bypass zone
+		return 14, 11, nil
+	}
+
 	out, err := cmd.Output()
 	if err != nil && len(out) == 0 {
-		return 0, 10, fmt.Errorf("traceroute probe failed: %w", err)
+		return 14, 11, fmt.Errorf("traceroute probe failed: %w", err)
 	}
 
 	maxHop := 0
@@ -69,25 +83,27 @@ func MeasureTargetTTL(endpoint string) (totalHops int, recommendedFakeTTL int, e
 	scanner := bufio.NewScanner(strings.NewReader(string(out)))
 	for scanner.Scan() {
 		line := scanner.Text()
-		matches := hopLineRegex.FindStringSubmatch(line)
-		if len(matches) >= 3 {
-			hopNum, err := strconv.Atoi(matches[1])
+		fields := strings.Fields(line)
+		if len(fields) >= 2 {
+			hopNum, err := strconv.Atoi(fields[0])
 			if err != nil {
 				continue
 			}
-			hopIP := matches[2]
-			if hopIP != "*" {
-				maxHop = hopNum
-				if hopIP == targetIPStr {
+			maxHop = hopNum
+			for _, f := range fields[1:] {
+				if f == targetIPStr {
 					destFound = true
 					break
 				}
+			}
+			if destFound {
+				break
 			}
 		}
 	}
 
 	if maxHop == 0 {
-		return 0, 10, fmt.Errorf("no responding hops discovered by traceroute")
+		return 14, 11, fmt.Errorf("no responding hops discovered by traceroute")
 	}
 
 	if destFound {

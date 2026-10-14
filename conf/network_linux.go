@@ -10,12 +10,13 @@ package conf
 import (
 	"fmt"
 	"net"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
 )
 
-// ApplyNetworkConfig applies IP addresses and MTU using system commands
+// ApplyNetworkConfig applies IP addresses, MTU, DNS, and routes using system commands
 func (c *Config) ApplyNetworkConfig(iface string) error {
 	// Set MTU
 	if c.MTU > 0 {
@@ -43,60 +44,78 @@ func (c *Config) ApplyNetworkConfig(iface string) error {
 		return fmt.Errorf("ip link set up dev %s failed: %v (%s)", iface, err, string(out))
 	}
 
-	// Apply routes for AllowedIPs (preventing routing loops for Endpoint)
+	// Apply routes for AllowedIPs (preventing routing loops for Endpoints)
 	if err := c.ApplyRoutes(iface); err != nil {
 		return fmt.Errorf("failed to apply routes for %s: %w", iface, err)
+	}
+
+	// Configure DNS if specified
+	if len(c.DNS) > 0 {
+		_ = applyDNSLinux(iface, c.DNS)
 	}
 
 	return nil
 }
 
-// ApplyRoutes configures system routing table for AllowedIPs
+// ApplyRoutes configures system routing table for AllowedIPs across all peers
 func (c *Config) ApplyRoutes(iface string) error {
-	if len(c.AllowedIPs) == 0 {
-		return nil
+	peers := c.Peers
+	if len(peers) == 0 && c.PublicKey != "" {
+		peers = []PeerConfig{{
+			PublicKey:  c.PublicKey,
+			Endpoint:   c.Endpoint,
+			AllowedIPs: c.AllowedIPs,
+		}}
 	}
 
-	// 1. If we have an Endpoint, resolve its IP and add a host route via default gateway
-	// to prevent routing loops when routing 0.0.0.0/0 into the WireGuard interface.
-	if c.Endpoint != "" {
-		endpointHost := c.Endpoint
-		if h, _, err := net.SplitHostPort(c.Endpoint); err == nil {
-			endpointHost = h
-		}
-		ips, err := net.LookupIP(endpointHost)
-		if err == nil && len(ips) > 0 {
-			for _, ip := range ips {
-				if ip4 := ip.To4(); ip4 != nil {
-					// Find default gateway for this IPv4
-					gw, gwDev, err := getDefaultGateway()
-					if err == nil && gw != "" && gwDev != iface {
-						_ = exec.Command("ip", "-4", "route", "add", ip4.String()+"/32", "via", gw, "dev", gwDev).Run()
+	// 1. For each Peer with an Endpoint, resolve IP and add direct host route via physical gateway
+	for _, peer := range peers {
+		if peer.Endpoint != "" {
+			endpointHost := peer.Endpoint
+			if h, _, err := net.SplitHostPort(peer.Endpoint); err == nil {
+				endpointHost = h
+			}
+			ips, err := net.LookupIP(endpointHost)
+			if err == nil && len(ips) > 0 {
+				for _, ip := range ips {
+					if ip4 := ip.To4(); ip4 != nil {
+						gw, gwDev, err := getDefaultGateway()
+						if err == nil && gw != "" && gwDev != iface {
+							_ = exec.Command("ip", "-4", "route", "replace", ip4.String()+"/32", "via", gw, "dev", gwDev).Run()
+						}
 					}
 				}
 			}
 		}
 	}
 
-	// 2. Add routes for AllowedIPs
-	for _, aip := range c.AllowedIPs {
+	// 2. Add routes for AllowedIPs across all peers
+	var allAllowedIPs []string
+	for _, peer := range peers {
+		allAllowedIPs = append(allAllowedIPs, peer.AllowedIPs...)
+	}
+	if len(allAllowedIPs) == 0 {
+		allAllowedIPs = c.AllowedIPs
+	}
+
+	for _, aip := range allAllowedIPs {
 		aip = strings.TrimSpace(aip)
 		if aip == "" {
 			continue
 		}
 		if aip == "0.0.0.0/0" {
 			// wg-quick style: split into two /1 subnets to override default route without destroying it
-			_ = exec.Command("ip", "-4", "route", "add", "0.0.0.0/1", "dev", iface).Run()
-			_ = exec.Command("ip", "-4", "route", "add", "128.0.0.0/1", "dev", iface).Run()
+			_ = exec.Command("ip", "-4", "route", "replace", "0.0.0.0/1", "dev", iface).Run()
+			_ = exec.Command("ip", "-4", "route", "replace", "128.0.0.0/1", "dev", iface).Run()
 		} else if aip == "::/0" {
-			_ = exec.Command("ip", "-6", "route", "add", "::/1", "dev", iface).Run()
-			_ = exec.Command("ip", "-6", "route", "add", "8000::/1", "dev", iface).Run()
+			_ = exec.Command("ip", "-6", "route", "replace", "::/1", "dev", iface).Run()
+			_ = exec.Command("ip", "-6", "route", "replace", "8000::/1", "dev", iface).Run()
 		} else {
 			family := "-4"
 			if strings.Contains(aip, ":") {
 				family = "-6"
 			}
-			_ = exec.Command("ip", family, "route", "add", aip, "dev", iface).Run()
+			_ = exec.Command("ip", family, "route", "replace", aip, "dev", iface).Run()
 		}
 	}
 
@@ -105,22 +124,43 @@ func (c *Config) ApplyRoutes(iface string) error {
 
 // CleanupRoutes removes added routes and endpoint host routes
 func (c *Config) CleanupRoutes(iface string) {
-	if c.Endpoint != "" {
-		endpointHost := c.Endpoint
-		if h, _, err := net.SplitHostPort(c.Endpoint); err == nil {
-			endpointHost = h
-		}
-		ips, err := net.LookupIP(endpointHost)
-		if err == nil {
-			for _, ip := range ips {
-				if ip4 := ip.To4(); ip4 != nil {
-					_ = exec.Command("ip", "-4", "route", "del", ip4.String()+"/32").Run()
+	cleanupDNSLinux(iface)
+
+	peers := c.Peers
+	if len(peers) == 0 && c.PublicKey != "" {
+		peers = []PeerConfig{{
+			PublicKey:  c.PublicKey,
+			Endpoint:   c.Endpoint,
+			AllowedIPs: c.AllowedIPs,
+		}}
+	}
+
+	for _, peer := range peers {
+		if peer.Endpoint != "" {
+			endpointHost := peer.Endpoint
+			if h, _, err := net.SplitHostPort(peer.Endpoint); err == nil {
+				endpointHost = h
+			}
+			ips, err := net.LookupIP(endpointHost)
+			if err == nil {
+				for _, ip := range ips {
+					if ip4 := ip.To4(); ip4 != nil {
+						_ = exec.Command("ip", "-4", "route", "del", ip4.String()+"/32").Run()
+					}
 				}
 			}
 		}
 	}
 
-	for _, aip := range c.AllowedIPs {
+	var allAllowedIPs []string
+	for _, peer := range peers {
+		allAllowedIPs = append(allAllowedIPs, peer.AllowedIPs...)
+	}
+	if len(allAllowedIPs) == 0 {
+		allAllowedIPs = c.AllowedIPs
+	}
+
+	for _, aip := range allAllowedIPs {
 		aip = strings.TrimSpace(aip)
 		if aip == "0.0.0.0/0" {
 			_ = exec.Command("ip", "-4", "route", "del", "0.0.0.0/1", "dev", iface).Run()
@@ -135,6 +175,59 @@ func (c *Config) CleanupRoutes(iface string) {
 			}
 			_ = exec.Command("ip", family, "route", "del", aip, "dev", iface).Run()
 		}
+	}
+}
+
+const resolvBakPath = "/etc/resolv.conf.travonet_bak"
+
+func applyDNSLinux(iface string, dnsServers []string) error {
+	if _, err := exec.LookPath("resolvectl"); err == nil {
+		args := append([]string{"dns", iface}, dnsServers...)
+		if err := exec.Command("resolvectl", args...).Run(); err == nil {
+			_ = exec.Command("resolvectl", "domain", iface, "~.").Run()
+			return nil
+		}
+	}
+
+	if _, err := exec.LookPath("resolvconf"); err == nil {
+		var lines []string
+		for _, d := range dnsServers {
+			lines = append(lines, "nameserver "+d)
+		}
+		cmd := exec.Command("resolvconf", "-a", "tun."+iface)
+		cmd.Stdin = strings.NewReader(strings.Join(lines, "\n") + "\n")
+		if err := cmd.Run(); err == nil {
+			return nil
+		}
+	}
+
+	// Fallback to /etc/resolv.conf
+	if _, err := os.Stat(resolvBakPath); os.IsNotExist(err) {
+		if content, err := os.ReadFile("/etc/resolv.conf"); err == nil {
+			_ = os.WriteFile(resolvBakPath, content, 0644)
+		}
+	}
+
+	var sb strings.Builder
+	sb.WriteString("# Generated by TravonetWG\n")
+	for _, d := range dnsServers {
+		sb.WriteString("nameserver " + d + "\n")
+	}
+	return os.WriteFile("/etc/resolv.conf", []byte(sb.String()), 0644)
+}
+
+func cleanupDNSLinux(iface string) {
+	if _, err := exec.LookPath("resolvectl"); err == nil {
+		_ = exec.Command("resolvectl", "revert", iface).Run()
+	}
+	if _, err := exec.LookPath("resolvconf"); err == nil {
+		_ = exec.Command("resolvconf", "-d", "tun."+iface).Run()
+	}
+	if _, err := os.Stat(resolvBakPath); err == nil {
+		if content, err := os.ReadFile(resolvBakPath); err == nil {
+			_ = os.WriteFile("/etc/resolv.conf", content, 0644)
+		}
+		_ = os.Remove(resolvBakPath)
 	}
 }
 

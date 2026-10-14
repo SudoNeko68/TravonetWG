@@ -20,7 +20,8 @@ import (
 const (
 	socksVersion5 = 0x05
 
-	authNone = 0x00
+	authNone     = 0x00
+	authUserPass = 0x02
 
 	cmdConnect      = 0x01
 	cmdBind         = 0x02
@@ -54,6 +55,8 @@ type SOCKS5Server struct {
 	wg       sync.WaitGroup
 	Debug    bool
 	conns    map[net.Conn]struct{}
+	Username string
+	Password string
 }
 
 // NewSOCKS5Server creates a new SOCKS5 proxy server
@@ -63,6 +66,14 @@ func NewSOCKS5Server(addr string, dialCtx DialContextFunc) *SOCKS5Server {
 		dialCtx: dialCtx,
 		conns:   make(map[net.Conn]struct{}),
 	}
+}
+
+// SetAuth sets username and password for RFC 1929 SOCKS5 authentication
+func (s *SOCKS5Server) SetAuth(username, password string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.Username = username
+	s.Password = password
 }
 
 // ListenAndServe starts accepting incoming SOCKS5 connections
@@ -160,6 +171,11 @@ func (s *SOCKS5Server) Addr() net.Addr {
 func (s *SOCKS5Server) handleConnection(client net.Conn) {
 	defer client.Close()
 
+	if tc, ok := client.(*net.TCPConn); ok {
+		_ = tc.SetKeepAlive(true)
+		_ = tc.SetKeepAlivePeriod(30 * time.Second)
+	}
+
 	_ = client.SetDeadline(time.Now().Add(30 * time.Second))
 
 	// 1. Negotiation Phase
@@ -179,24 +195,80 @@ func (s *SOCKS5Server) handleConnection(client net.Conn) {
 		return
 	}
 
-	// We only require NO AUTH (0x00)
-	hasNoAuth := false
-	for _, m := range methods {
-		if m == authNone {
-			hasNoAuth = true
-			break
+	s.mu.Lock()
+	requireAuth := s.Username != "" && s.Password != ""
+	expectedUser := s.Username
+	expectedPass := s.Password
+	s.mu.Unlock()
+
+	if requireAuth {
+		hasUserPass := false
+		for _, m := range methods {
+			if m == authUserPass {
+				hasUserPass = true
+				break
+			}
 		}
-	}
+		if !hasUserPass {
+			_, _ = client.Write([]byte{socksVersion5, 0xFF})
+			return
+		}
 
-	if !hasNoAuth {
-		// 0xFF = No acceptable methods
-		_, _ = client.Write([]byte{socksVersion5, 0xFF})
-		return
-	}
+		// Reply requiring Username/Password (0x02)
+		if _, err := client.Write([]byte{socksVersion5, authUserPass}); err != nil {
+			return
+		}
 
-	// Server reply: VER (5) | METHOD (0: NO AUTH)
-	if _, err := client.Write([]byte{socksVersion5, authNone}); err != nil {
-		return
+		// Read RFC 1929 subnegotiation: VER | ULEN | UNAME | PLEN | PASSWD
+		subHeader := make([]byte, 2)
+		if _, err := io.ReadFull(client, subHeader); err != nil || subHeader[0] != 0x01 {
+			_, _ = client.Write([]byte{0x01, 0x01})
+			return
+		}
+		uLen := int(subHeader[1])
+		uname := make([]byte, uLen)
+		if _, err := io.ReadFull(client, uname); err != nil {
+			_, _ = client.Write([]byte{0x01, 0x01})
+			return
+		}
+		pLenBuf := make([]byte, 1)
+		if _, err := io.ReadFull(client, pLenBuf); err != nil {
+			_, _ = client.Write([]byte{0x01, 0x01})
+			return
+		}
+		pLen := int(pLenBuf[0])
+		passwd := make([]byte, pLen)
+		if _, err := io.ReadFull(client, passwd); err != nil {
+			_, _ = client.Write([]byte{0x01, 0x01})
+			return
+		}
+
+		if string(uname) != expectedUser || string(passwd) != expectedPass {
+			_, _ = client.Write([]byte{0x01, 0x01})
+			return
+		}
+		// Success
+		if _, err := client.Write([]byte{0x01, 0x00}); err != nil {
+			return
+		}
+	} else {
+		hasNoAuth := false
+		for _, m := range methods {
+			if m == authNone {
+				hasNoAuth = true
+				break
+			}
+		}
+
+		if !hasNoAuth {
+			_, _ = client.Write([]byte{socksVersion5, 0xFF})
+			return
+		}
+
+		// Server reply: VER (5) | METHOD (0: NO AUTH)
+		if _, err := client.Write([]byte{socksVersion5, authNone}); err != nil {
+			return
+		}
 	}
 
 	// 2. Request Phase
@@ -286,22 +358,40 @@ func (s *SOCKS5Server) handleConnection(client net.Conn) {
 	_ = client.SetDeadline(time.Time{})
 	_ = remote.SetDeadline(time.Time{})
 
-	// 5. Bidirectional copy (pipe)
-	done := make(chan struct{})
+	// 5. Bidirectional copy (pipe) with proper teardown to prevent leaks
+	var closeOnce sync.Once
+	closeBoth := func() {
+		closeOnce.Do(func() {
+			_ = client.Close()
+			_ = remote.Close()
+		})
+	}
+
+	var pipeWg sync.WaitGroup
+	pipeWg.Add(2)
+
 	go func() {
+		defer pipeWg.Done()
 		_, _ = io.Copy(remote, client)
 		if cw, ok := remote.(interface{ CloseWrite() error }); ok {
 			_ = cw.CloseWrite()
+		} else {
+			closeBoth()
 		}
-		close(done)
 	}()
 
-	_, _ = io.Copy(client, remote)
-	if cw, ok := client.(interface{ CloseWrite() error }); ok {
-		_ = cw.CloseWrite()
-	}
+	go func() {
+		defer pipeWg.Done()
+		_, _ = io.Copy(client, remote)
+		if cw, ok := client.(interface{ CloseWrite() error }); ok {
+			_ = cw.CloseWrite()
+		} else {
+			closeBoth()
+		}
+	}()
 
-	<-done
+	pipeWg.Wait()
+	closeBoth()
 }
 
 func sendReply(w io.Writer, rep byte, bindIP net.IP, bindPort uint16) error {

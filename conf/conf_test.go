@@ -142,3 +142,50 @@ PersistentKeepalive = 25
 		})
 	}
 }
+
+func TestMultiplePeersAndPSK(t *testing.T) {
+	confContent := `[Interface]
+PrivateKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+Address = 10.0.0.2/24
+DNS = 1.1.1.1, 8.8.8.8
+
+[Peer]
+PublicKey = BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=
+PresharedKey = CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC=
+Endpoint = 192.168.1.1:51820
+AllowedIPs = 10.0.0.0/24
+
+[Peer]
+PublicKey = DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD=
+Endpoint = 192.168.2.1:51820
+AllowedIPs = 10.0.1.0/24
+PersistentKeepalive = 15
+`
+	cfg, err := ParseConfigString(confContent)
+	if err != nil {
+		t.Fatalf("ParseConfigString failed: %v", err)
+	}
+
+	if len(cfg.Peers) != 2 {
+		t.Fatalf("expected 2 peers, got %d", len(cfg.Peers))
+	}
+
+	if cfg.Peers[0].PresharedKey != "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC=" {
+		t.Errorf("peer 0 PSK mismatch: %s", cfg.Peers[0].PresharedKey)
+	}
+	if cfg.Peers[1].PersistentKeepalive != 15 {
+		t.Errorf("peer 1 keepalive mismatch: %d", cfg.Peers[1].PersistentKeepalive)
+	}
+
+	uapi, err := cfg.ToUAPI()
+	if err != nil {
+		t.Fatalf("ToUAPI failed: %v", err)
+	}
+
+	if !strings.Contains(uapi, "preshared_key=") {
+		t.Errorf("ToUAPI missing preshared_key:\n%s", uapi)
+	}
+	if strings.Count(uapi, "public_key=") != 2 {
+		t.Errorf("expected 2 public_key in ToUAPI, got count %d:\n%s", strings.Count(uapi, "public_key="), uapi)
+	}
+}

@@ -56,8 +56,9 @@ type Step struct {
 
 // Strategy contains compiled pipeline steps
 type Strategy struct {
-	Raw   string
-	Steps []Step
+	Raw      string
+	Steps    []Step
+	Warnings []string
 }
 
 func (s *Strategy) String() string {
@@ -180,12 +181,23 @@ func ParseStrategy(dsl string, defaultFakeTTL, defaultNormalTTL int) (*Strategy,
 		return FivePacketStrategy(defaultFakeTTL, defaultNormalTTL), nil
 	}
 
+	// Support Zapret/legacy aliases mentioned in docs
+	switch strings.ToLower(clean) {
+	case "fake,ipfrag2", "fake,split2":
+		clean = "fake_udp(148) -> frag(8) -> frag(148)"
+	case "ipfrag2", "split2":
+		clean = "frag(8) -> frag(148)"
+	case "fake", "fake_udp", "fake_packet":
+		clean = "fake_udp(148)"
+	}
+
 	// Delimiters can be "->" or ";" or newlines
 	normalized := strings.ReplaceAll(clean, "\n", "->")
 	normalized = strings.ReplaceAll(normalized, ";", "->")
 	rawParts := strings.Split(normalized, "->")
 
 	var steps []Step
+	var warnings []string
 	currentOffset := 0
 
 	for _, part := range rawParts {
@@ -294,6 +306,10 @@ func ParseStrategy(dsl string, defaultFakeTTL, defaultNormalTTL int) (*Strategy,
 				return nil, fmt.Errorf("frag action requires positive length: '%s'", part)
 			}
 
+			if step.MF && step.Length%8 != 0 {
+				warnings = append(warnings, fmt.Sprintf("fragment '%s': length (%d) is not a multiple of 8 octets; RFC 791 IPv4 reassembly on the receiving endpoint may fail", part, step.Length))
+			}
+
 			currentOffset = step.Offset + step.Length
 			steps = append(steps, step)
 
@@ -397,8 +413,9 @@ func ParseStrategy(dsl string, defaultFakeTTL, defaultNormalTTL int) (*Strategy,
 	}
 
 	return &Strategy{
-		Raw:   clean,
-		Steps: steps,
+		Raw:      clean,
+		Steps:    steps,
+		Warnings: warnings,
 	}, nil
 }
 

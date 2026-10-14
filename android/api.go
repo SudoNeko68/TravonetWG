@@ -10,6 +10,7 @@ package main
 
 // #cgo LDFLAGS: -llog
 // #include <android/log.h>
+// #include <stdlib.h>
 import "C"
 
 import (
@@ -38,21 +39,16 @@ import (
 
 type AndroidLogger struct {
 	level C.int
-	tag   *C.char
-}
-
-func cstring(s string) *C.char {
-	b, err := unix.BytePtrFromString(s)
-	if err != nil {
-		b := [1]C.char{}
-		return &b[0]
-	}
-	return (*C.char)(unsafe.Pointer(b))
+	tag   string
 }
 
 func (l AndroidLogger) Printf(format string, args ...interface{}) {
 	msg := fmt.Sprintf(format, args...)
-	C.__android_log_write(l.level, l.tag, cstring(msg))
+	cTag := C.CString(l.tag)
+	cMsg := C.CString(msg)
+	C.__android_log_write(l.level, cTag, cMsg)
+	C.free(unsafe.Pointer(cTag))
+	C.free(unsafe.Pointer(cMsg))
 }
 
 type TunnelHandle struct {
@@ -68,11 +64,13 @@ type Socks5Handle struct {
 }
 
 var (
-	tunnelMu      sync.Mutex
-	tunnelHandles = make(map[int32]TunnelHandle)
+	tunnelMu         sync.Mutex
+	tunnelHandles    = make(map[int32]TunnelHandle)
+	nextTunnelHandle int32
 
-	socksMu      sync.Mutex
-	socksHandles = make(map[int32]*Socks5Handle)
+	socksMu         sync.Mutex
+	socksHandles    = make(map[int32]*Socks5Handle)
+	nextSocksHandle int32
 )
 
 func init() {
@@ -86,7 +84,11 @@ func init() {
 				n--
 			}
 			buf[n] = 0
-			C.__android_log_write(C.ANDROID_LOG_ERROR, cstring("TravonetWG/Stacktrace"), (*C.char)(unsafe.Pointer(&buf[0])))
+			cTag := C.CString("TravonetWG/Stacktrace")
+			cMsg := C.CString(string(buf[:n]))
+			C.__android_log_write(C.ANDROID_LOG_ERROR, cTag, cMsg)
+			C.free(unsafe.Pointer(cTag))
+			C.free(unsafe.Pointer(cMsg))
 		}
 	}()
 }
@@ -188,7 +190,7 @@ func parseSettings(settings string, logger *device.Logger) (cleanUapi string, ev
 
 //export wgTurnOn
 func wgTurnOn(interfaceName string, tunFd int32, settings string) int32 {
-	tag := cstring("TravonetWG/" + interfaceName)
+	tag := "TravonetWG/" + interfaceName
 	logger := &device.Logger{
 		Verbosef: AndroidLogger{level: C.ANDROID_LOG_DEBUG, tag: tag}.Printf,
 		Errorf:   AndroidLogger{level: C.ANDROID_LOG_ERROR, tag: tag}.Printf,
@@ -258,22 +260,22 @@ func wgTurnOn(interfaceName string, tunFd int32, settings string) int32 {
 
 	tunnelMu.Lock()
 	defer tunnelMu.Unlock()
-	var i int32
-	for i = 0; i < math.MaxInt32; i++ {
-		if _, exists := tunnelHandles[i]; !exists {
-			break
+	for attempts := 0; attempts < math.MaxInt32; attempts++ {
+		nextTunnelHandle++
+		if nextTunnelHandle <= 0 {
+			nextTunnelHandle = 1
+		}
+		if _, exists := tunnelHandles[nextTunnelHandle]; !exists {
+			tunnelHandles[nextTunnelHandle] = TunnelHandle{device: dev, uapi: uapi, bind: evasionBind}
+			return nextTunnelHandle
 		}
 	}
-	if i == math.MaxInt32 {
-		logger.Errorf("Unable to find empty handle")
-		if uapiFile != nil {
-			uapiFile.Close()
-		}
-		dev.Close()
-		return -1
+	logger.Errorf("Unable to find empty handle")
+	if uapiFile != nil {
+		uapiFile.Close()
 	}
-	tunnelHandles[i] = TunnelHandle{device: dev, uapi: uapi, bind: evasionBind}
-	return i
+	dev.Close()
+	return -1
 }
 
 //export wgTurnOff
@@ -356,7 +358,7 @@ func wgStartSocks5(listenAddr string, settings string) int32 {
 	if listenAddr == "" {
 		listenAddr = "127.0.0.1:1080"
 	}
-	tag := cstring("TravonetWG/SOCKS5")
+	tag := "TravonetWG/SOCKS5"
 	logger := &device.Logger{
 		Verbosef: AndroidLogger{level: C.ANDROID_LOG_DEBUG, tag: tag}.Printf,
 		Errorf:   AndroidLogger{level: C.ANDROID_LOG_ERROR, tag: tag}.Printf,
@@ -432,24 +434,23 @@ func wgStartSocks5(listenAddr string, settings string) int32 {
 
 	socksMu.Lock()
 	defer socksMu.Unlock()
-	var i int32
-	for i = 0; i < math.MaxInt32; i++ {
-		if _, exists := socksHandles[i]; !exists {
-			break
+	for attempts := 0; attempts < math.MaxInt32; attempts++ {
+		nextSocksHandle++
+		if nextSocksHandle <= 0 {
+			nextSocksHandle = 1
+		}
+		if _, exists := socksHandles[nextSocksHandle]; !exists {
+			socksHandles[nextSocksHandle] = &Socks5Handle{
+				server: socksServer,
+				device: dev,
+				bind:   evasionBind,
+			}
+			return nextSocksHandle
 		}
 	}
-	if i == math.MaxInt32 {
-		_ = socksServer.Close()
-		dev.Close()
-		return -1
-	}
-
-	socksHandles[i] = &Socks5Handle{
-		server: socksServer,
-		device: dev,
-		bind:   evasionBind,
-	}
-	return i
+	_ = socksServer.Close()
+	dev.Close()
+	return -1
 }
 
 //export wgStopSocks5

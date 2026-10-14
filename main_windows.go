@@ -125,6 +125,7 @@ Modes:
 Options:
   -c, --config FILE             Load WireGuard configuration file (.conf)
   --socks, --socks5 [ADDR:PORT] Start userspace SOCKS5 proxy (default: 127.0.0.1:1080)
+  --socks-auth USER:PASS        Enable RFC 1929 username/password auth for SOCKS5 proxy
   -s, --strategy DSL            Evasion pipeline DSL (default: "fake(148) -> frag(8) -> frag(72) -> fake(148) -> frag(76)")
   --fake-ttl N|auto             TTL for fake packets (number 1-255 or 'auto' for hop distance probe)
   --pre-junk N                  Size in bytes of initial junk UDP packet (default: 64, 0 to disable)
@@ -177,6 +178,7 @@ func main() {
 	var cliStrategy string
 	var cliPreJunk int = -1
 	var cliSocks5 string
+	var cliSocksAuth string
 
 	for i := 1; i < len(os.Args); i++ {
 		arg := os.Args[i]
@@ -197,6 +199,11 @@ func main() {
 			if i+1 < len(os.Args) {
 				i++
 				configFile = os.Args[i]
+			}
+		case "--socks-auth", "-socks-auth":
+			if i+1 < len(os.Args) {
+				i++
+				cliSocksAuth = os.Args[i]
 			}
 		case "--socks5", "-socks5", "--socks", "-socks":
 			cliSocks5 = "127.0.0.1:1080"
@@ -228,6 +235,10 @@ func main() {
 				}
 			}
 		default:
+			if strings.HasPrefix(arg, "--socks-auth=") || strings.HasPrefix(arg, "-socks-auth=") {
+				cliSocksAuth = arg[strings.Index(arg, "=")+1:]
+				continue
+			}
 			if strings.HasPrefix(arg, "--socks5=") || strings.HasPrefix(arg, "-socks5=") ||
 				strings.HasPrefix(arg, "--socks=") || strings.HasPrefix(arg, "-socks=") {
 				val := arg[strings.Index(arg, "=")+1:]
@@ -335,7 +346,7 @@ func main() {
 			return
 		}
 
-		runSocks5Windows(socks5Addr, parsedConfig, evasionCfg, debug)
+		runSocks5Windows(socks5Addr, cliSocksAuth, parsedConfig, evasionCfg, debug)
 		return
 	}
 
@@ -360,7 +371,7 @@ func main() {
 	runTunWindows(interfaceName, parsedConfig, evasionCfg, debug)
 }
 
-func runSocks5Windows(socks5Addr string, parsedConfig *conf.Config, evasionCfg conn.EvasionConfig, debug bool) {
+func runSocks5Windows(socks5Addr, socksAuth string, parsedConfig *conf.Config, evasionCfg conn.EvasionConfig, debug bool) {
 	if evasionCfg.Strategy != "" && evasionCfg.Strategy != "default" {
 		if _, err := conn.ParseStrategy(evasionCfg.Strategy, evasionCfg.FakeTTL, evasionCfg.NormalTTL); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: invalid evasion strategy: %v\n", err)
@@ -437,6 +448,13 @@ func runSocks5Windows(socks5Addr string, parsedConfig *conf.Config, evasionCfg c
 
 	socksServer := proxy.NewSOCKS5Server(socks5Addr, tnet.DialContext)
 	socksServer.Debug = debug
+	if socksAuth != "" {
+		if user, pass, ok := strings.Cut(socksAuth, ":"); ok {
+			socksServer.SetAuth(user, pass)
+		} else {
+			fmt.Fprintf(os.Stderr, "Warning: invalid socks-auth format %q (expected USER:PASS)\n", socksAuth)
+		}
+	}
 
 	fmt.Println("┌──────────────────────────────────────────────────────────────┐")
 	fmt.Println("│                                                              │")
@@ -444,7 +462,9 @@ func runSocks5Windows(socks5Addr string, parsedConfig *conf.Config, evasionCfg c
 	fmt.Println("│   Zero-Admin / Pure Userspace Mode (Windows Netstack)        │")
 	fmt.Println("│                                                              │")
 	fmt.Println("└──────────────────────────────────────────────────────────────┘")
-	if unsafe, reason := isNonLoopbackAddress(socks5Addr); unsafe {
+	if socksServer.Username != "" {
+		fmt.Printf("🔒 SOCKS5 Authentication:    Enabled (User: %s)\n", socksServer.Username)
+	} else if unsafe, reason := isNonLoopbackAddress(socks5Addr); unsafe {
 		fmt.Fprintln(os.Stderr, "WARNING: Non-loopback address bound: ", reason)
 	}
 	fmt.Printf("SOCKS5 Proxy Listening on: %s\n", socks5Addr)
