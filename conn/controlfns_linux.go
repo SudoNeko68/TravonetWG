@@ -45,6 +45,23 @@ func kernelVersion() (major, minor int) {
 func init() {
 	controlFns = append(controlFns,
 
+		// Protect the freshly created socket from VPN routing loops. On Android
+		// this invokes VpnService.protect(fd) synchronously, before bind() and
+		// before the first datagram is sent, so the socket is never captured by
+		// the tun0 default route.
+		func(network, address string, c syscall.RawConn) error {
+			if runtime.GOOS != "android" {
+				return nil
+			}
+			var protectErr error
+			if err := c.Control(func(fd uintptr) {
+				protectErr = ProtectSocket(int(fd))
+			}); err != nil {
+				return err
+			}
+			return protectErr
+		},
+
 		// Attempt to set the socket buffer size beyond net.core.{r,w}mem_max by
 		// using SO_*BUFFORCE. This requires CAP_NET_ADMIN, and is allowed here to
 		// fail silently - the result of failure is lower performance on very fast

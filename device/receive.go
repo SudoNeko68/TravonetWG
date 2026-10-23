@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/crypto/chacha20"
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
@@ -31,6 +32,7 @@ type QueueInboundElement struct {
 	counter  uint64
 	keypair  *Keypair
 	endpoint conn.Endpoint
+	padding  int // AmneziaWG S4 prefix length of the received message
 }
 
 type QueueInboundElementsContainer struct {
@@ -133,8 +135,33 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 
 			// check size of packet
 
-			packet := bufsArrs[i][:size]
-			msgType := binary.LittleEndian.Uint32(packet[:4])
+			rawPacket := bufsArrs[i][:size]
+
+			var cip *chacha20.Cipher
+			var typeHashBuf [4]byte
+			typeHash := typeHashBuf[:]
+
+			if !device.amnezia.headerProtection.key.IsZero() && len(rawPacket) >= HeaderCipherNonceSize {
+				var err error
+				cip, err = device.HeaderProtectionCipher(rawPacket[:HeaderCipherNonceSize])
+				if err != nil {
+					device.log.Errorf("Failed to initialize header cipher: %v", err)
+					continue
+				}
+				if cip != nil {
+					cip.XORKeyStream(typeHash, typeHash)
+				}
+			}
+
+			packet, msgType, padding, ok := device.determinePacketTypeAndPadding(rawPacket, typeHash)
+			if !ok {
+				// Unknown, malformed or AmneziaWG junk/signature packet.
+				continue
+			}
+
+			if cip != nil {
+				applyHash(packet[:4], packet[:4], typeHash)
+			}
 
 			switch msgType {
 
@@ -146,6 +173,9 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 
 				if len(packet) < MessageTransportSize {
 					continue
+				}
+				if cip != nil {
+					cip.XORKeyStream(packet[4:MessageTransportHeaderSize], packet[4:MessageTransportHeaderSize])
 				}
 
 				// lookup key pair
@@ -161,7 +191,7 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 
 				// check keypair expiry
 
-				if keypair.created.Add(RejectAfterTime).Before(time.Now()) {
+				if keypair.created.Add(device.keychainExpireTime()).Before(time.Now()) {
 					continue
 				}
 
@@ -173,6 +203,12 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 				elem.keypair = keypair
 				elem.endpoint = endpoints[i]
 				elem.counter = 0
+				elem.padding = padding
+
+				udpWindow := uint32(padding + MessageTransportHeaderSize + len(packet))
+				if peer.udpWindow.Load() < udpWindow {
+					peer.udpWindow.Store(udpWindow)
+				}
 
 				elemsForPeer, ok := elemsByPeer[peer]
 				if !ok {
@@ -188,19 +224,31 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 			// otherwise it is a fixed size & handshake related packet
 
 			case MessageInitiationType:
-				if len(packet) != MessageInitiationSize {
+				if len(packet) < MessageInitiationSize {
 					continue
 				}
+				if cip != nil {
+					cip.XORKeyStream(packet[4:MessageInitiationSize], packet[4:MessageInitiationSize])
+				}
+				packet = packet[:MessageInitiationSize]
 
 			case MessageResponseType:
-				if len(packet) != MessageResponseSize {
+				if len(packet) < MessageResponseSize {
 					continue
 				}
+				if cip != nil {
+					cip.XORKeyStream(packet[4:MessageResponseSize], packet[4:MessageResponseSize])
+				}
+				packet = packet[:MessageResponseSize]
 
 			case MessageCookieReplyType:
-				if len(packet) != MessageCookieReplySize {
+				if len(packet) < MessageCookieReplySize {
 					continue
 				}
+				if cip != nil {
+					cip.XORKeyStream(packet[4:MessageCookieReplySize], packet[4:MessageCookieReplySize])
+				}
+				packet = packet[:MessageCookieReplySize]
 
 			default:
 				device.log.Verbosef("Received message with unknown type")
@@ -444,6 +492,7 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 		validTailPacket := -1
 		dataPacketReceived := false
 		rxBytesLen := uint64(0)
+		transportOffset := MessageTransportOffsetContent
 		for i, elem := range elemsContainer.elems {
 			if elem.packet == nil {
 				// decryption failed
@@ -462,7 +511,7 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 			}
 			rxBytesLen += uint64(len(elem.packet) + MinMessageSize)
 
-			if len(elem.packet) == 0 {
+			if len(elem.packet) == 0 || elem.packet[0] == 0 {
 				device.log.Verbosef("%v - Receiving keepalive packet", peer)
 				continue
 			}
@@ -507,7 +556,11 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 				continue
 			}
 
-			bufs = append(bufs, elem.buffer[:MessageTransportOffsetContent+len(elem.packet)])
+			// AmneziaWG transport messages are decrypted after the S4 random
+			// prefix, so the plaintext starts S4 bytes later than in vanilla
+			// WireGuard.  The TUN writer must use the same offset.
+			transportOffset = MessageTransportOffsetContent + elem.padding
+			bufs = append(bufs, elem.buffer[:transportOffset+len(elem.packet)])
 		}
 
 		peer.rxBytes.Add(rxBytesLen)
@@ -521,7 +574,7 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 			peer.timersDataReceived()
 		}
 		if len(bufs) > 0 {
-			_, err := device.tun.device.Write(bufs, MessageTransportOffsetContent)
+			_, err := device.tun.device.Write(bufs, transportOffset)
 			if err != nil && !device.isClosed() {
 				device.log.Errorf("Failed to write packets to TUN device: %v", err)
 			}

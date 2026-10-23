@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"runtime"
 	"sync"
 	"syscall"
 	"time"
@@ -267,6 +268,12 @@ func (tun *NativeTun) setMTU(n int) error {
 func (tun *NativeTun) MTU() (int, error) {
 	name, err := tun.Name()
 	if err != nil {
+		if runtime.GOOS == "android" {
+			// VpnService-created descriptors are not guaranteed to be ioctl-able
+			// under SELinux; the Builder MTU is the authoritative value and
+			// Android always uses 1280.
+			return 1280, nil
+		}
 		return 0, err
 	}
 
@@ -277,6 +284,9 @@ func (tun *NativeTun) MTU() (int, error) {
 		0,
 	)
 	if err != nil {
+		if runtime.GOOS == "android" {
+			return 1280, nil
+		}
 		return 0, err
 	}
 
@@ -293,6 +303,9 @@ func (tun *NativeTun) MTU() (int, error) {
 		uintptr(unsafe.Pointer(&ifr[0])),
 	)
 	if errno != 0 {
+		if runtime.GOOS == "android" {
+			return 1280, nil
+		}
 		return 0, fmt.Errorf("failed to get MTU of TUN device: %w", errno)
 	}
 
@@ -311,6 +324,9 @@ func (tun *NativeTun) initNameCache() {
 func (tun *NativeTun) nameSlow() (string, error) {
 	sysconn, err := tun.tunFile.SyscallConn()
 	if err != nil {
+		if runtime.GOOS == "android" {
+			return "tun0", nil
+		}
 		return "", err
 	}
 	var ifr [ifReqSize]byte
@@ -324,9 +340,16 @@ func (tun *NativeTun) nameSlow() (string, error) {
 		)
 	})
 	if err != nil {
+		if runtime.GOOS == "android" {
+			return "tun0", nil
+		}
 		return "", fmt.Errorf("failed to get name of TUN device: %w", err)
 	}
 	if errno != 0 {
+		if runtime.GOOS == "android" {
+			// SELinux may deny TUNGETIFF on a VpnService descriptor.
+			return "tun0", nil
+		}
 		return "", fmt.Errorf("failed to get name of TUN device: %w", errno)
 	}
 	return unix.ByteSliceToString(ifr[:]), nil
@@ -511,6 +534,11 @@ const (
 func (tun *NativeTun) initFromFlags(name string) error {
 	sc, err := tun.tunFile.SyscallConn()
 	if err != nil {
+		if runtime.GOOS == "android" {
+			tun.vnetHdr = false
+			tun.batchSize = 1
+			return nil
+		}
 		return err
 	}
 	if e := sc.Control(func(fd uintptr) {
@@ -523,6 +551,13 @@ func (tun *NativeTun) initFromFlags(name string) error {
 		}
 		err = unix.IoctlIfreq(int(fd), unix.TUNGETIFF, ifr)
 		if err != nil {
+			if runtime.GOOS == "android" {
+				// VpnService descriptors generally reject TUNGETIFF under
+				// SELinux. Fall back to the plain, batched-off data path.
+				err = nil
+				tun.vnetHdr = false
+				tun.batchSize = 1
+			}
 			return
 		}
 		got := ifr.Uint16()
@@ -531,6 +566,11 @@ func (tun *NativeTun) initFromFlags(name string) error {
 			// if IFF_VNET_HDR is set.
 			err = unix.IoctlSetInt(int(fd), unix.TUNSETOFFLOAD, tunTCPOffloads)
 			if err != nil {
+				if runtime.GOOS == "android" {
+					err = nil
+					tun.vnetHdr = false
+					tun.batchSize = 1
+				}
 				return
 			}
 			tun.vnetHdr = true
@@ -647,6 +687,7 @@ func CreateUnmonitoredTUNFromFD(fd int) (Device, string, error) {
 		tcpGROTable: newTCPGROTable(),
 		udpGROTable: newUDPGROTable(),
 		toWrite:     make([]int, 0, conn.IdealBatchSize),
+		batchSize:   1,
 	}
 	name, err := tun.Name()
 	if err != nil {

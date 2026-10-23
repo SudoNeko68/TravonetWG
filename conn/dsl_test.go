@@ -12,7 +12,7 @@ import (
 )
 
 func TestParseDefaultStrategy(t *testing.T) {
-	st, err := ParseStrategy("default", 10, 64)
+	st, err := ParseStrategy("default")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -21,58 +21,70 @@ func TestParseDefaultStrategy(t *testing.T) {
 		t.Fatalf("expected 5 steps in default strategy, got %d", len(st.Steps))
 	}
 
-	// 1. Fake UDP 1 (148 bytes, TTL=10)
-	if st.Steps[0].Action != ActionFakeUDP || st.Steps[0].Length != 148 || st.Steps[0].TTL != 10 {
+	if st.Steps[0].Action != ActionMimic || st.Steps[0].MimicProto != "quic" {
 		t.Errorf("step 0 mismatch: %+v", st.Steps[0])
 	}
-	// 2. Frag 1 (8 bytes UDP header, MF=true)
-	if st.Steps[1].Action != ActionFrag || st.Steps[1].Length != 8 || st.Steps[1].Offset != 0 || !st.Steps[1].MF {
+	if st.Steps[1].Action != ActionMimic || st.Steps[1].MimicProto != "stun" {
 		t.Errorf("step 1 mismatch: %+v", st.Steps[1])
 	}
-	// 3. Frag 2 (72 bytes WG payload, MF=true)
-	if st.Steps[2].Action != ActionFrag || st.Steps[2].Length != 72 || st.Steps[2].Offset != 8 || !st.Steps[2].MF {
+	if st.Steps[2].Action != ActionJunk || st.Steps[2].Length != 64 {
 		t.Errorf("step 2 mismatch: %+v", st.Steps[2])
 	}
-	// 4. Fake UDP 2 (148 bytes, TTL=10)
-	if st.Steps[3].Action != ActionFakeUDP || st.Steps[3].Length != 148 || st.Steps[3].TTL != 10 {
+	if st.Steps[3].Action != ActionFakeUDP || st.Steps[3].Length != 148 || !st.Steps[3].CorruptHeader || st.Steps[3].IPOptMode != "" {
 		t.Errorf("step 3 mismatch: %+v", st.Steps[3])
 	}
-	// 5. Frag 3 (76 bytes WG payload, MF=false, TTL=64)
-	if st.Steps[4].Action != ActionFrag || st.Steps[4].Length != 76 || st.Steps[4].Offset != 80 || st.Steps[4].MF != false {
+	if st.Steps[4].Action != ActionSleep || st.Steps[4].SleepDur != 15*time.Millisecond {
 		t.Errorf("step 4 mismatch: %+v", st.Steps[4])
 	}
 }
 
-func TestParseFivePacketStrategy(t *testing.T) {
-	st, err := ParseStrategy("5packet", 3, 64)
+func TestParseBroadbandStrategy(t *testing.T) {
+	st, err := ParseStrategy("broadband")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
 	if len(st.Steps) != 5 {
-		t.Fatalf("expected 5 steps in 5packet strategy, got %d", len(st.Steps))
+		t.Fatalf("expected 5 steps in broadband strategy, got %d", len(st.Steps))
 	}
-
-	if st.Steps[0].Action != ActionJunk || st.Steps[0].Length != 64 {
-		t.Errorf("step 0 mismatch: %+v", st.Steps[0])
-	}
-	if st.Steps[1].Action != ActionFrag || st.Steps[1].Length != 8 || st.Steps[1].Offset != 0 || !st.Steps[1].MF {
-		t.Errorf("step 1 mismatch: %+v", st.Steps[1])
-	}
-	if st.Steps[2].Action != ActionFrag || st.Steps[2].Length != 80 || st.Steps[2].Offset != 8 || !st.Steps[2].MF {
+	if st.Steps[2].Action != ActionJumboFake || st.Steps[2].Length != 1600 {
 		t.Errorf("step 2 mismatch: %+v", st.Steps[2])
 	}
-	if st.Steps[3].Action != ActionFakeFrag || st.Steps[3].Length != 32 || st.Steps[3].Offset != 88 || st.Steps[3].MF != false || st.Steps[3].TTL != 3 {
+	if st.Steps[3].Action != ActionFakeUDP || st.Steps[3].IPOptMode != "ts" {
 		t.Errorf("step 3 mismatch: %+v", st.Steps[3])
-	}
-	if st.Steps[4].Action != ActionFrag || st.Steps[4].Length != 68 || st.Steps[4].Offset != 88 || st.Steps[4].MF != false {
-		t.Errorf("step 4 mismatch: %+v", st.Steps[4])
 	}
 }
 
-func TestParseCustomPipeline(t *testing.T) {
-	input := "junk(size=128, badsum=true) -> frag(len=16) -> fake_frag(offset=16, len=48, mf=0, ttl=4) -> frag(len=140)"
-	st, err := ParseStrategy(input, 3, 64)
+func TestLegacyRawAliasesBecomeUserspace(t *testing.T) {
+	// These aliases used to select raw L3 fragmentation. On non-rooted Android
+	// they must resolve to a userspace-safe strategy.
+	for _, alias := range []string{"5packet", "early-term", "ipfrag2", "split2", "userspace"} {
+		st, err := ParseStrategy(alias)
+		if err != nil {
+			t.Fatalf("failed to parse alias %s: %v", alias, err)
+		}
+		if len(st.Steps) != 5 {
+			t.Errorf("alias %s: expected 5 userspace steps, got %d", alias, len(st.Steps))
+		}
+	}
+
+	for _, alias := range []string{"fake", "fake_udp", "fake_packet", "fake,ipfrag2", "fake,split2"} {
+		st, err := ParseStrategy(alias)
+		if err != nil {
+			t.Fatalf("failed to parse alias %s: %v", alias, err)
+		}
+		if len(st.Steps) != 1 || st.Steps[0].Action != ActionFakeUDP {
+			t.Errorf("alias %s: expected a single fake_udp step, got %+v", alias, st.Steps)
+		}
+		if st.Steps[0].TTL != 0 {
+			t.Errorf("alias %s: expected auto TTL, got %d", alias, st.Steps[0].TTL)
+		}
+	}
+}
+
+func TestParseCustomUserspacePipeline(t *testing.T) {
+	input := "junk(size=128, badsum=true) -> mimic(quic) -> fake_udp(size=148, ttl=4, corrupt=true) -> sleep(5ms)"
+	st, err := ParseStrategy(input)
 	if err != nil {
 		t.Fatalf("unexpected parse error: %v", err)
 	}
@@ -80,82 +92,51 @@ func TestParseCustomPipeline(t *testing.T) {
 	if len(st.Steps) != 4 {
 		t.Fatalf("expected 4 steps, got %d", len(st.Steps))
 	}
-
-	if st.Steps[0].Action != ActionJunk || st.Steps[0].Length != 128 || !st.Steps[0].Badsum {
+	if st.Steps[0].Action != ActionJunk || st.Steps[0].Length != 128 {
 		t.Errorf("step 0 error: %+v", st.Steps[0])
 	}
-	if st.Steps[1].Action != ActionFrag || st.Steps[1].Length != 16 || st.Steps[1].Offset != 0 {
+	if len(st.Warnings) == 0 {
+		t.Error("expected a warning for unsupported badsum")
+	}
+	if st.Steps[1].Action != ActionMimic || st.Steps[1].MimicProto != "quic" {
 		t.Errorf("step 1 error: %+v", st.Steps[1])
 	}
-	if st.Steps[2].Action != ActionFakeFrag || st.Steps[2].Offset != 16 || st.Steps[2].Length != 48 || st.Steps[2].MF || st.Steps[2].TTL != 4 {
+	if st.Steps[2].Action != ActionFakeUDP || st.Steps[2].Length != 148 || st.Steps[2].TTL != 4 || !st.Steps[2].CorruptHeader {
 		t.Errorf("step 2 error: %+v", st.Steps[2])
 	}
-	if st.Steps[3].Action != ActionFrag || st.Steps[3].Offset != 16 || st.Steps[3].Length != 140 {
+	if st.Steps[3].Action != ActionSleep || st.Steps[3].SleepDur != 5*time.Millisecond {
 		t.Errorf("step 3 error: %+v", st.Steps[3])
 	}
 }
 
 func TestParseSleepAndFakeUDP(t *testing.T) {
-	input := "junk(64) -> sleep(10ms) -> fake_udp(size=80, ttl=3) -> frag(8) -> frag(148)"
-	st, err := ParseStrategy(input, 3, 64)
+	input := "junk(64) -> sleep(10ms) -> fake_udp(size=80, ttl=3) -> ipopt_shift(8, mode=nop)"
+	st, err := ParseStrategy(input)
 	if err != nil {
 		t.Fatalf("unexpected parse error: %v", err)
 	}
 
-	if len(st.Steps) != 5 {
-		t.Fatalf("expected 5 steps, got %d", len(st.Steps))
+	if len(st.Steps) != 4 {
+		t.Fatalf("expected 4 steps, got %d", len(st.Steps))
 	}
-
 	if st.Steps[1].Action != ActionSleep || st.Steps[1].SleepDur != 10*time.Millisecond {
 		t.Errorf("sleep step error: %+v", st.Steps[1])
 	}
 	if st.Steps[2].Action != ActionFakeUDP || st.Steps[2].Length != 80 || st.Steps[2].TTL != 3 {
 		t.Errorf("fake_udp step error: %+v", st.Steps[2])
 	}
-}
-
-func TestParseFakeFragMF1(t *testing.T) {
-	input := "frag(8) -> fake_frag(offset=8, len=32, mf=1, ttl=10) -> frag(offset=8, len=148, mf=0, ttl=64)"
-	st, err := ParseStrategy(input, 10, 64)
-	if err != nil {
-		t.Fatalf("unexpected parse error: %v", err)
-	}
-
-	if len(st.Steps) != 3 {
-		t.Fatalf("expected 3 steps, got %d", len(st.Steps))
-	}
-
-	if st.Steps[1].Action != ActionFakeFrag || st.Steps[1].Offset != 8 || st.Steps[1].Length != 32 || !st.Steps[1].MF || st.Steps[1].TTL != 10 {
-		t.Errorf("fake_frag step error: %+v", st.Steps[1])
-	}
-	if st.Steps[2].Action != ActionFrag || st.Steps[2].Offset != 8 || st.Steps[2].Length != 148 || st.Steps[2].MF || st.Steps[2].TTL != 64 {
-		t.Errorf("frag step error: %+v", st.Steps[2])
+	if st.Steps[3].Action != ActionIPOptShift || st.Steps[3].Length != 8 || st.Steps[3].IPOptMode != "nop" {
+		t.Errorf("ipopt_shift step error: %+v", st.Steps[3])
 	}
 }
 
-func TestParseStrategyAliases(t *testing.T) {
-	cases := []struct {
-		input     string
-		stepCount int
-		firstAct  ActionType
-	}{
-		{"fake,ipfrag2", 3, ActionFakeUDP},
-		{"fake,split2", 3, ActionFakeUDP},
-		{"ipfrag2", 2, ActionFrag},
-		{"split2", 2, ActionFrag},
-		{"fake", 1, ActionFakeUDP},
-	}
-
-	for _, tc := range cases {
-		st, err := ParseStrategy(tc.input, 11, 64)
-		if err != nil {
-			t.Fatalf("failed to parse alias %s: %v", tc.input, err)
-		}
-		if len(st.Steps) != tc.stepCount {
-			t.Errorf("alias %s: expected %d steps, got %d", tc.input, tc.stepCount, len(st.Steps))
-		}
-		if st.Steps[0].Action != tc.firstAct {
-			t.Errorf("alias %s: expected first action %v, got %v", tc.input, tc.firstAct, st.Steps[0].Action)
+func TestRejectRawFragmentationActions(t *testing.T) {
+	for _, input := range []string{
+		"frag(8) -> frag(148)",
+		"fake_frag(offset=8, len=32, mf=0, ttl=5)",
+	} {
+		if _, err := ParseStrategy(input); err == nil {
+			t.Errorf("expected %q to be rejected on non-rooted Android", input)
 		}
 	}
 }

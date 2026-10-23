@@ -7,128 +7,97 @@
 package conn
 
 import (
-	"bufio"
 	"context"
 	"fmt"
 	"net"
-	"os/exec"
-	"regexp"
-	"runtime"
 	"strconv"
-	"strings"
 	"time"
 )
 
-var hopLineRegex = regexp.MustCompile(`^\s*(\d+)\s+([^\s]+)`)
+const (
+	// minFakeTTL .. maxFakeTTL is the DPI-safe window: the decoy must survive
+	// long enough to reach the domestic DPI but expire before the real server.
+	// On cellular networks (LTE/5G), hops to the carrier border TSPU are often 4-6,
+	// so maxFakeTTL is expanded to 8.
+	minFakeTTL = 3
+	maxFakeTTL = 8
 
-// MeasureTargetTTL measures the network distance (hops) to target endpoint
-// and calculates optimal FakeTTL for DPI early-termination desync.
+	// maxProbeTTL bounds the AutoTTL probe. Beyond this distance the
+	// recommendation is already saturated, and mobile networks frequently
+	// filter ICMP entirely, so probing further only wastes battery.
+	maxProbeTTL = 14
+
+	// autoTTLDNSTimeout bounds name resolution inside the probe.
+	autoTTLDNSTimeout = 3 * time.Second
+)
+
+// lookupIPv4 resolves a hostname with a bounded timeout and returns its first
+// IPv4 address. The probe runs in the background, but it must never hang on a
+// black-holed resolver, so a context timeout is essential on Android.
+func lookupIPv4(host string) (net.IP, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), autoTTLDNSTimeout)
+	defer cancel()
+
+	addrs, err := net.DefaultResolver.LookupNetIP(ctx, "ip4", host)
+	if err != nil {
+		return nil, err
+	}
+	for _, addr := range addrs {
+		if addr.Is4() {
+			return net.IP(addr.AsSlice()), nil
+		}
+	}
+	return nil, fmt.Errorf("no IPv4 address found for %s", host)
+}
+
+// MeasureTargetTTL measures the network distance (hops) to the target endpoint
+// and calculates the optimal FakeTTL for DPI early-termination desync.
+//
+// On Android the distance is measured without root through IP_RECVERR /
+// MSG_ERRQUEUE, so no traceroute binary or CAP_NET_RAW is required. The probe
+// may take up to ~0.7s, so callers must not run it on a latency-sensitive
+// thread; the Android backend runs it in a goroutine after the tunnel is up.
 func MeasureTargetTTL(endpoint string) (totalHops int, recommendedFakeTTL int, err error) {
+	fallback := defaultFakeTTLForPlatform()
+
 	host := endpoint
-	if h, _, err := net.SplitHostPort(endpoint); err == nil {
+	port := 51820
+	if h, p, splitErr := net.SplitHostPort(endpoint); splitErr == nil {
 		host = h
+		if parsedPort, convErr := strconv.Atoi(p); convErr == nil && parsedPort > 0 {
+			port = parsedPort
+		}
 	}
 
 	ip := net.ParseIP(host)
 	if ip == nil {
-		// Resolve hostname if needed
-		ips, err := net.LookupIP(host)
-		if err != nil || len(ips) == 0 {
-			return 0, 10, fmt.Errorf("failed to resolve endpoint %s: %v", host, err)
+		resolved, lookupErr := lookupIPv4(host)
+		if lookupErr != nil {
+			return 0, fallback, fmt.Errorf("failed to resolve endpoint %s: %w", host, lookupErr)
 		}
-		for _, candidate := range ips {
-			if candidate.To4() != nil {
-				ip = candidate
-				break
-			}
-		}
-		if ip == nil {
-			return 0, 10, fmt.Errorf("no IPv4 address found for %s", host)
-		}
+		ip = resolved
 	}
 
-	targetIPStr := ip.String()
-
-	// Probe using platform-specific traceroute tool
-	var cmd *exec.Cmd
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-
-	if runtime.GOOS == "windows" {
-		tracertPath, err := exec.LookPath("tracert")
-		if err == nil {
-			cmd = exec.CommandContext(ctx, tracertPath, "-d", "-h", "22", "-w", "1000", targetIPStr)
-		}
-	} else {
-		if trPath, err := exec.LookPath("traceroute"); err == nil {
-			cmd = exec.CommandContext(ctx, trPath, "-q", "1", "-w", "1", "-m", "22", "-n", targetIPStr)
-		} else if tpPath, err := exec.LookPath("tracepath"); err == nil {
-			cmd = exec.CommandContext(ctx, tpPath, "-m", "22", "-n", targetIPStr)
-		}
+	hops, probeErr := measureTTLViaErrQueue(ip, port)
+	if probeErr != nil {
+		return 0, fallback, fmt.Errorf("kernel TTL probe unavailable: %w", probeErr)
 	}
-
-	if cmd == nil {
-		// No traceroute tool found on system; fallback to safe default for DPI bypass zone
-		return 14, 11, nil
+	if hops <= 0 {
+		return 0, fallback, fmt.Errorf("kernel TTL probe returned no hops")
 	}
+	return hops, recommendFakeTTL(hops), nil
+}
 
-	out, err := cmd.Output()
-	if err != nil && len(out) == 0 {
-		return 14, 11, fmt.Errorf("traceroute probe failed: %w", err)
+// recommendFakeTTL derives a safe fake TTL from the measured hop count. The
+// fake packet must traverse the domestic DPI (TSPU) but expire before reaching
+// the foreign server. The Android-safe window is minFakeTTL..maxFakeTTL.
+func recommendFakeTTL(totalHops int) int {
+	recommended := totalHops - 4
+	if recommended < minFakeTTL {
+		recommended = minFakeTTL
 	}
-
-	maxHop := 0
-	destFound := false
-
-	scanner := bufio.NewScanner(strings.NewReader(string(out)))
-	for scanner.Scan() {
-		line := scanner.Text()
-		fields := strings.Fields(line)
-		if len(fields) >= 2 {
-			hopNum, err := strconv.Atoi(fields[0])
-			if err != nil {
-				continue
-			}
-			maxHop = hopNum
-			for _, f := range fields[1:] {
-				if f == targetIPStr {
-					destFound = true
-					break
-				}
-			}
-			if destFound {
-				break
-			}
-		}
+	if recommended > maxFakeTTL {
+		recommended = maxFakeTTL
 	}
-
-	if maxHop == 0 {
-		return 14, 11, fmt.Errorf("no responding hops discovered by traceroute")
-	}
-
-	if destFound {
-		totalHops = maxHop
-	} else {
-		totalHops = maxHop + 1
-	}
-
-	// Calculate optimal FakeTTL:
-	// The fake packet must pass through the domestic DPI (TSPU),
-	// but expire before reaching the foreign server.
-	// For international routes (e.g. Russia -> Cloudflare in EU):
-	// Total hops ~13-15, domestic border ~8-10.
-	switch {
-	case totalHops >= 12:
-		recommendedFakeTTL = totalHops - 4
-	case totalHops >= 8:
-		recommendedFakeTTL = totalHops - 3
-	default:
-		recommendedFakeTTL = totalHops - 2
-	}
-
-	if recommendedFakeTTL < 3 {
-		recommendedFakeTTL = 3
-	}
-
-	return totalHops, recommendedFakeTTL, nil
+	return recommended
 }

@@ -367,7 +367,7 @@ func main() {
 	}
 
 	if evasionCfg.Strategy != "" && evasionCfg.Strategy != "default" {
-		if _, err := conn.ParseStrategy(evasionCfg.Strategy, evasionCfg.FakeTTL, evasionCfg.NormalTTL); err != nil {
+		if _, err := conn.ParseStrategy(evasionCfg.Strategy); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: invalid evasion strategy: %v\n", err)
 			os.Exit(ExitSetupFailed)
 		}
@@ -596,7 +596,7 @@ func main() {
 func runSocks5Userspace(socks5Addr string, socksAuth string, parsedConfig *conf.Config, evasionCfg conn.EvasionConfig, debug bool) {
 	// 1. Validate strategy if specified
 	if evasionCfg.Strategy != "" && evasionCfg.Strategy != "default" {
-		if _, err := conn.ParseStrategy(evasionCfg.Strategy, evasionCfg.FakeTTL, evasionCfg.NormalTTL); err != nil {
+		if _, err := conn.ParseStrategy(evasionCfg.Strategy); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: invalid evasion strategy: %v\n", err)
 			os.Exit(ExitSetupFailed)
 			return

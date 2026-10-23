@@ -1,8 +1,2 @@
-wireguard-go
-/travonet-wg
 *.test
-*.exe
-*.so
-*.dll
 build/
-

@@ -13,6 +13,22 @@ import (
 
 const DefaultMTU = 1420
 
+// SetMTU overrides the MTU used by the device without issuing any ioctl on the
+// underlying TUN interface. It is used on Android, where the descriptor created
+// by VpnService.Builder cannot be reconfigured and MTU() may be unavailable.
+func (device *Device) SetMTU(mtu int) {
+	if mtu <= 0 {
+		return
+	}
+	if mtu > MaxContentSize {
+		mtu = MaxContentSize
+	}
+	old := device.tun.mtu.Swap(int32(mtu))
+	if int(old) != mtu {
+		device.log.Verbosef("MTU updated: %v", mtu)
+	}
+}
+
 func (device *Device) RoutineTUNEventReader() {
 	device.log.Verbosef("Routine: event worker - started")
 

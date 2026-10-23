@@ -12,6 +12,9 @@ import (
 	"syscall"
 )
 
+// IP_NODEFRAG is socket option 22 on Linux IPPROTO_IP
+const IP_NODEFRAG = 22
+
 func initRawSocket() (int, error) {
 	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_RAW)
 	if err != nil {

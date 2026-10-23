@@ -188,3 +188,81 @@ func TestSOCKS5ServerAuth(t *testing.T) {
 		t.Fatalf("expected auth success 0x00, got 0x%02x", authResp[1])
 	}
 }
+
+// TestSOCKS5ListenReportsBindErrors verifies that binding is synchronous: the
+// Android backend must not report a running proxy before the port is bound.
+func TestSOCKS5ListenReportsBindErrors(t *testing.T) {
+	occupied, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to occupy a port: %v", err)
+	}
+	defer occupied.Close()
+
+	busy := NewSOCKS5Server(occupied.Addr().String(), nil)
+	if err := busy.Listen(); err == nil {
+		busy.Close()
+		t.Fatal("expected Listen to fail on an occupied port")
+	}
+
+	free := NewSOCKS5Server("127.0.0.1:0", nil)
+	if err := free.Listen(); err != nil {
+		t.Fatalf("Listen failed: %v", err)
+	}
+	defer free.Close()
+
+	if addr := free.Addr(); addr == nil {
+		t.Fatal("Addr must be available right after Listen")
+	}
+	if err := free.Listen(); err != nil {
+		t.Fatalf("second Listen must be a no-op, got %v", err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if err := free.Serve(); err != nil {
+			t.Errorf("Serve: %v", err)
+		}
+	}()
+
+	// Closing must unblock Serve and let it return nil.
+	if err := free.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Serve did not return after Close")
+	}
+}
+
+// TestSOCKS5HalfConfiguredAuthFailsClosed makes sure a username without a
+// password (or vice versa) never degrades into an unauthenticated proxy.
+func TestSOCKS5HalfConfiguredAuthFailsClosed(t *testing.T) {
+	srv := NewSOCKS5Server("127.0.0.1:0", nil)
+	srv.SetAuth("", "secret")
+	if err := srv.Listen(); err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	defer srv.Close()
+	go func() {
+		_ = srv.Serve()
+	}()
+
+	conn, err := net.Dial("tcp", srv.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	if _, err := conn.Write([]byte{0x05, 0x01, 0x00}); err != nil {
+		t.Fatalf("write handshake: %v", err)
+	}
+	resp := make([]byte, 2)
+	if _, err := io.ReadFull(conn, resp); err != nil {
+		t.Fatalf("read handshake: %v", err)
+	}
+	if resp[1] != 0xFF {
+		t.Fatalf("expected no acceptable method (0xFF), got 0x%02x", resp[1])
+	}
+}

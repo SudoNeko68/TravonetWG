@@ -13,48 +13,49 @@ import (
 	"time"
 )
 
-// ActionType represents an action in the Evasion DSL pipeline
+// ActionType represents an action in the userspace Evasion DSL pipeline.
 type ActionType int
 
 const (
 	ActionJunk ActionType = iota
-	ActionFrag
-	ActionFakeFrag
 	ActionFakeUDP
 	ActionSleep
+	ActionMimic
+	ActionJumboFake
+	ActionIPOptShift
 )
 
 func (a ActionType) String() string {
 	switch a {
 	case ActionJunk:
 		return "junk"
-	case ActionFrag:
-		return "frag"
-	case ActionFakeFrag:
-		return "fake_frag"
 	case ActionFakeUDP:
 		return "fake_udp"
 	case ActionSleep:
 		return "sleep"
+	case ActionMimic:
+		return "mimic"
+	case ActionJumboFake:
+		return "jumbo_fake"
+	case ActionIPOptShift:
+		return "ipopt_shift"
 	default:
 		return "unknown"
 	}
 }
 
-// Step represents a single compiled instruction in an evasion strategy
+// Step represents a single compiled instruction in an evasion strategy.
 type Step struct {
-	Action   ActionType
-	Offset   int           // Byte offset (-1 for auto-tracking from previous frag)
-	Length   int           // Length of payload to send
-	AutoMF   bool          // If true, MF is calculated based on reaching end of packet
-	MF       bool          // More Fragments flag
-	TTL      int           // TTL for this packet (0 = default normal TTL)
-	Badsum   bool          // Corrupt UDP checksum (for junk/fake_udp)
-	SleepDur time.Duration // Duration for ActionSleep
-	Payload  string        // "random", "zeros", or raw hex
+	Action        ActionType
+	Length        int           // Length of the UDP payload for this step
+	TTL           int           // 0 = engine default: NormalTTL for junk/mimic, live FakeTTL for fake_udp/jumbo_fake
+	SleepDur      time.Duration // Duration for ActionSleep
+	MimicProto    string        // "stun", "quic" or "dns" for ActionMimic
+	IPOptMode     string        // "nop", "ts", "rr" or "none" for IPv4 options
+	CorruptHeader bool          // Corrupt the fake WireGuard header to avoid stateless bans
 }
 
-// Strategy contains compiled pipeline steps
+// Strategy contains compiled pipeline steps.
 type Strategy struct {
 	Raw      string
 	Steps    []Step
@@ -69,136 +70,129 @@ func (s *Strategy) String() string {
 	for _, step := range s.Steps {
 		switch step.Action {
 		case ActionJunk:
-			parts = append(parts, fmt.Sprintf("junk(size=%d, badsum=%v)", step.Length, step.Badsum))
-		case ActionFrag:
-			if step.Offset >= 0 {
-				parts = append(parts, fmt.Sprintf("frag(offset=%d, len=%d, mf=%v, ttl=%d)", step.Offset, step.Length, step.MF, step.TTL))
-			} else {
-				parts = append(parts, fmt.Sprintf("frag(len=%d, ttl=%d)", step.Length, step.TTL))
-			}
-		case ActionFakeFrag:
-			parts = append(parts, fmt.Sprintf("fake_frag(offset=%d, len=%d, mf=%v, ttl=%d)", step.Offset, step.Length, step.MF, step.TTL))
+			parts = append(parts, fmt.Sprintf("junk(size=%d)", step.Length))
 		case ActionFakeUDP:
-			parts = append(parts, fmt.Sprintf("fake_udp(size=%d, ttl=%d)", step.Length, step.TTL))
+			parts = append(parts, fmt.Sprintf("fake_udp(size=%d, ttl=%s, corrupt=%v, ipopt=%s)", step.Length, formatTTL(step.TTL), step.CorruptHeader, step.IPOptMode))
 		case ActionSleep:
 			parts = append(parts, fmt.Sprintf("sleep(%v)", step.SleepDur))
+		case ActionMimic:
+			parts = append(parts, fmt.Sprintf("mimic(%s)", step.MimicProto))
+		case ActionJumboFake:
+			parts = append(parts, fmt.Sprintf("jumbo_fake(size=%d, ttl=%s)", step.Length, formatTTL(step.TTL)))
+		case ActionIPOptShift:
+			parts = append(parts, fmt.Sprintf("ipopt_shift(%d, mode=%s)", step.Length, step.IPOptMode))
 		}
 	}
 	return strings.Join(parts, " -> ")
 }
 
-// DefaultStrategy creates the proven 5-step dual-fake evasion pipeline:
-// fake(148) -> frag(8) -> frag(72) -> fake(148) -> frag(76)
-func DefaultStrategy(fakeTTL, normalTTL int) *Strategy {
-	return &Strategy{
-		Raw: "fake(148) -> frag(8) -> frag(72) -> fake(148) -> frag(76)",
-		Steps: []Step{
-			{
-				Action: ActionFakeUDP,
-				Length: WGHandshakeInitiationSize,
-				TTL:    fakeTTL,
-			},
-			{
-				Action: ActionFrag,
-				Offset: 0,
-				Length: UDPHeaderSize, // 8 bytes (UDP header)
-				MF:     true,
-				TTL:    normalTTL,
-			},
-			{
-				Action: ActionFrag,
-				Offset: UDPHeaderSize, // 8 bytes
-				Length: 72,            // 72 bytes
-				MF:     true,
-				TTL:    normalTTL,
-			},
-			{
-				Action: ActionFakeUDP,
-				Length: WGHandshakeInitiationSize,
-				TTL:    fakeTTL,
-			},
-			{
-				Action: ActionFrag,
-				Offset: UDPHeaderSize + 72,                             // 80 bytes
-				Length: WGHandshakeInitiationSize + UDPHeaderSize - 80, // 76 bytes (80 + 76 = 156 bytes total)
-				MF:     false,                                          // Real termination for server
-				TTL:    normalTTL,
-			},
-		},
+// formatTTL renders a step TTL for logs. TTL 0 means "resolve at send time".
+func formatTTL(ttl int) string {
+	if ttl <= 0 {
+		return "auto"
 	}
+	return strconv.Itoa(ttl)
 }
 
-// FivePacketStrategy creates the experimental 5-packet early-termination pipeline:
-// junk(64) -> frag(8) -> frag(80) -> fake_frag(offset=88, len=32, mf=0, ttl=fakeTTL) -> frag(68)
-func FivePacketStrategy(fakeTTL, normalTTL int) *Strategy {
+// DefaultUserspaceStrategy creates the unprivileged, mobile-safe Android desync pipeline.
+// It relies only on standard unfragmented UDP datagrams without IP Options:
+//
+//	mimic(quic) -> mimic(stun) -> junk(64) -> fake_udp(148, corrupt=true) -> sleep(15ms)
+//
+// The legitimate WireGuard handshake is appended by the caller.
+//
+// Key mobile-safe design choices:
+//   - No IP Options (ipopt): cellular carriers (LTE/5G PGW/UPF) drop packets with IP Options (IHL > 5).
+//   - No L3 fragmentation (jumbo_fake): cellular networks drop UDP fragments.
+//   - All packets fit within mobile MTU (<= 1200 bytes).
+//   - 15ms sleep allows cellular radio scheduling (PUCCH/PUSCH BSR) to serialize decoys before the real handshake.
+//
+// Steps are compiled with TTL 0, meaning "resolve at send time": mimic and junk
+// packets use NormalTTL, while fake_udp uses the bind's live FakeTTL (defaulting to 7 on Android).
+func DefaultUserspaceStrategy() *Strategy {
 	return &Strategy{
-		Raw: "junk(64) -> frag(8) -> frag(80) -> fake_frag(offset=88, len=32, mf=0) -> frag(68)",
+		Raw: "mimic(quic) -> mimic(stun) -> junk(size=64) -> fake_udp(size=148, corrupt=true) -> sleep(15ms)",
 		Steps: []Step{
+			{
+				Action:     ActionMimic,
+				MimicProto: "quic",
+			},
+			{
+				Action:     ActionMimic,
+				MimicProto: "stun",
+			},
 			{
 				Action: ActionJunk,
 				Length: 64,
-				TTL:    normalTTL,
 			},
 			{
-				Action: ActionFrag,
-				Offset: 0,
-				Length: UDPHeaderSize, // 8 bytes (UDP header)
-				MF:     true,
-				TTL:    normalTTL,
+				Action:        ActionFakeUDP,
+				Length:        WGHandshakeInitiationSize,
+				CorruptHeader: true,
 			},
 			{
-				Action: ActionFrag,
-				Offset: UDPHeaderSize,      // 8 bytes
-				Length: DefaultPart1WGSize, // 80 bytes
-				MF:     true,
-				TTL:    normalTTL,
-			},
-			{
-				Action: ActionFakeFrag,
-				Offset: UDPHeaderSize + DefaultPart1WGSize, // 88 bytes
-				Length: 32,
-				MF:     false, // MF=0 Early Termination poison for DPI
-				TTL:    fakeTTL,
-			},
-			{
-				Action: ActionFrag,
-				Offset: UDPHeaderSize + DefaultPart1WGSize,                                                 // 88 bytes
-				Length: (UDPHeaderSize + WGHandshakeInitiationSize) - (UDPHeaderSize + DefaultPart1WGSize), // 68 bytes
-				MF:     false,                                                                              // Real termination for server
-				TTL:    normalTTL,
+				Action:   ActionSleep,
+				SleepDur: 15 * time.Millisecond,
 			},
 		},
 	}
 }
 
-// ParseStrategy compiles a DSL pipeline string (e.g. "junk(64) -> frag(8) -> frag(80) -> fake_frag(88, 32, 0, 3) -> frag(68)")
-func ParseStrategy(dsl string, defaultFakeTTL, defaultNormalTTL int) (*Strategy, error) {
-	clean := strings.TrimSpace(dsl)
-	if clean == "" || strings.EqualFold(clean, "default") {
-		return DefaultStrategy(defaultFakeTTL, defaultNormalTTL), nil
+// BroadbandUserspaceStrategy provides the legacy oversized decoy strategy
+// for wired broadband / Wi-Fi connections that do not drop IP Options or fragments.
+func BroadbandUserspaceStrategy() *Strategy {
+	return &Strategy{
+		Raw: "mimic(quic) -> mimic(stun) -> jumbo_fake(size=1600) -> fake_udp(size=148, ipopt=ts) -> sleep(2ms)",
+		Steps: []Step{
+			{
+				Action:     ActionMimic,
+				MimicProto: "quic",
+			},
+			{
+				Action:     ActionMimic,
+				MimicProto: "stun",
+			},
+			{
+				Action: ActionJumboFake,
+				Length: 1600,
+			},
+			{
+				Action:        ActionFakeUDP,
+				Length:        WGHandshakeInitiationSize,
+				IPOptMode:     "ts",
+				CorruptHeader: true,
+			},
+			{
+				Action:   ActionSleep,
+				SleepDur: 2 * time.Millisecond,
+			},
+		},
 	}
-	if strings.EqualFold(clean, "5packet") || strings.EqualFold(clean, "early-term") {
-		return FivePacketStrategy(defaultFakeTTL, defaultNormalTTL), nil
-	}
+}
 
-	// Support Zapret/legacy aliases mentioned in docs
+// ParseStrategy compiles a userspace DSL pipeline string. Only actions that can
+// be executed without CAP_NET_RAW are accepted; raw L3 fragmentation actions
+// are deliberately rejected and cause the caller to fall back to the default
+// userspace pipeline.
+func ParseStrategy(dsl string) (*Strategy, error) {
+	clean := strings.TrimSpace(dsl)
 	switch strings.ToLower(clean) {
-	case "fake,ipfrag2", "fake,split2":
-		clean = "fake_udp(148) -> frag(8) -> frag(148)"
-	case "ipfrag2", "split2":
-		clean = "frag(8) -> frag(148)"
-	case "fake", "fake_udp", "fake_packet":
+	case "", "default", "default-userspace", "userspace", "mobile", "mobile-safe", "5packet", "early-term", "ipfrag2", "split2":
+		return DefaultUserspaceStrategy(), nil
+	case "broadband", "wifi", "wifi-jumbo", "jumbo":
+		return BroadbandUserspaceStrategy(), nil
+	case "fake,ipfrag2", "fake,split2", "fake", "fake_udp", "fake_packet":
+		// Old raw-fragmentation aliases degrade to the userspace fake packet.
 		clean = "fake_udp(148)"
 	}
 
-	// Delimiters can be "->" or ";" or newlines
+	// Delimiters can be "->" or ";" or newlines.
 	normalized := strings.ReplaceAll(clean, "\n", "->")
 	normalized = strings.ReplaceAll(normalized, ";", "->")
 	rawParts := strings.Split(normalized, "->")
 
 	var steps []Step
 	var warnings []string
-	currentOffset := 0
 
 	for _, part := range rawParts {
 		part = strings.TrimSpace(part)
@@ -237,8 +231,7 @@ func ParseStrategy(dsl string, defaultFakeTTL, defaultNormalTTL int) (*Strategy,
 		case "junk", "udp_junk", "pre_junk":
 			step := Step{
 				Action: ActionJunk,
-				Length: 64, // default size
-				TTL:    defaultNormalTTL,
+				Length: 64,
 			}
 			if szStr, ok := namedArgs["size"]; ok {
 				step.Length, _ = strconv.Atoi(szStr)
@@ -247,123 +240,18 @@ func ParseStrategy(dsl string, defaultFakeTTL, defaultNormalTTL int) (*Strategy,
 			} else if len(posArgs) > 0 {
 				step.Length, _ = strconv.Atoi(posArgs[0])
 			}
-
-			if bStr, ok := namedArgs["badsum"]; ok {
-				step.Badsum = parseBool(bStr)
-			} else if len(posArgs) > 1 {
-				step.Badsum = parseBool(posArgs[1])
-			}
-
-			if tStr, ok := namedArgs["ttl"]; ok {
-				step.TTL, _ = strconv.Atoi(tStr)
-			}
-			steps = append(steps, step)
-
-		case "frag", "fragment":
-			step := Step{
-				Action: ActionFrag,
-				Offset: currentOffset,
-				Length: 0,
-				AutoMF: true,
-				MF:     true,
-				TTL:    defaultNormalTTL,
-			}
-
-			// Parse offset / slice
-			if sliceStr, ok := namedArgs["slice"]; ok {
-				// slice=start:end or slice=offset:len
-				parts := strings.Split(sliceStr, ":")
-				if len(parts) == 2 {
-					start, _ := strconv.Atoi(parts[0])
-					end, _ := strconv.Atoi(parts[1])
-					step.Offset = start
-					step.Length = end - start
-				}
-			} else {
-				if offStr, ok := namedArgs["offset"]; ok {
-					step.Offset, _ = strconv.Atoi(offStr)
-				}
-				if lenStr, ok := namedArgs["len"]; ok {
-					step.Length, _ = strconv.Atoi(lenStr)
-				} else if szStr, ok := namedArgs["size"]; ok {
-					step.Length, _ = strconv.Atoi(szStr)
-				} else if len(posArgs) > 0 {
-					step.Length, _ = strconv.Atoi(posArgs[0])
-				}
-			}
-
-			if mfStr, ok := namedArgs["mf"]; ok {
-				step.AutoMF = false
-				step.MF = parseBool(mfStr)
+			if bStr, ok := namedArgs["badsum"]; ok && parseBool(bStr) {
+				warnings = append(warnings, fmt.Sprintf("junk '%s': badsum requires a raw socket and is ignored on Android", part))
 			}
 			if tStr, ok := namedArgs["ttl"]; ok {
 				step.TTL, _ = strconv.Atoi(tStr)
-			} else if len(posArgs) > 1 {
-				step.TTL, _ = strconv.Atoi(posArgs[1])
 			}
-
-			if step.Length <= 0 {
-				return nil, fmt.Errorf("frag action requires positive length: '%s'", part)
-			}
-
-			if step.MF && step.Length%8 != 0 {
-				warnings = append(warnings, fmt.Sprintf("fragment '%s': length (%d) is not a multiple of 8 octets; RFC 791 IPv4 reassembly on the receiving endpoint may fail", part, step.Length))
-			}
-
-			currentOffset = step.Offset + step.Length
-			steps = append(steps, step)
-
-		case "fake_frag", "fakefrag", "fake_fragment":
-			step := Step{
-				Action: ActionFakeFrag,
-				Offset: currentOffset,
-				Length: 32,    // default 32B noise
-				MF:     false, // default false (Early-Termination trick!)
-				TTL:    defaultFakeTTL,
-			}
-
-			if offStr, ok := namedArgs["offset"]; ok {
-				step.Offset, _ = strconv.Atoi(offStr)
-			} else if len(posArgs) > 0 && strings.Contains(part, "offset=") {
-				// handled by named
-			}
-
-			if lenStr, ok := namedArgs["len"]; ok {
-				step.Length, _ = strconv.Atoi(lenStr)
-			} else if szStr, ok := namedArgs["size"]; ok {
-				step.Length, _ = strconv.Atoi(szStr)
-			}
-
-			// Positional fallback: fake_frag(offset, len, mf, ttl)
-			if len(posArgs) >= 1 && namedArgs["offset"] == "" && namedArgs["len"] == "" {
-				step.Offset, _ = strconv.Atoi(posArgs[0])
-			}
-			if len(posArgs) >= 2 && namedArgs["len"] == "" {
-				step.Length, _ = strconv.Atoi(posArgs[1])
-			}
-			if len(posArgs) >= 3 && namedArgs["mf"] == "" {
-				step.MF = parseBool(posArgs[2])
-			} else if mfStr, ok := namedArgs["mf"]; ok {
-				step.MF = parseBool(mfStr)
-			}
-
-			if tStr, ok := namedArgs["ttl"]; ok {
-				step.TTL, _ = strconv.Atoi(tStr)
-			} else if len(posArgs) >= 4 {
-				step.TTL, _ = strconv.Atoi(posArgs[3])
-			}
-
-			if pStr, ok := namedArgs["payload"]; ok {
-				step.Payload = pStr
-			}
-
 			steps = append(steps, step)
 
 		case "fake_udp", "fakeudp", "fake", "fake_packet":
 			step := Step{
 				Action: ActionFakeUDP,
 				Length: WGHandshakeInitiationSize,
-				TTL:    defaultFakeTTL,
 			}
 			if szStr, ok := namedArgs["size"]; ok {
 				step.Length, _ = strconv.Atoi(szStr)
@@ -379,6 +267,89 @@ func ParseStrategy(dsl string, defaultFakeTTL, defaultNormalTTL int) (*Strategy,
 				step.TTL, _ = strconv.Atoi(posArgs[1])
 			}
 
+			if ipOpt, ok := namedArgs["ipopt"]; ok {
+				step.IPOptMode = strings.ToLower(ipOpt)
+			}
+			if corrupt, ok := namedArgs["corrupt"]; ok {
+				step.CorruptHeader = parseBool(corrupt)
+			}
+
+			steps = append(steps, step)
+
+		case "mimic", "mimicry":
+			step := Step{
+				Action:     ActionMimic,
+				MimicProto: "stun",
+			}
+			if proto, ok := namedArgs["proto"]; ok {
+				step.MimicProto = strings.ToLower(proto)
+			} else if len(posArgs) > 0 {
+				step.MimicProto = strings.ToLower(posArgs[0])
+			}
+			switch step.MimicProto {
+			case "stun", "quic", "dns":
+			default:
+				return nil, fmt.Errorf("mimic action requires one of stun/quic/dns, got '%s'", step.MimicProto)
+			}
+			if tStr, ok := namedArgs["ttl"]; ok {
+				step.TTL, _ = strconv.Atoi(tStr)
+			}
+			steps = append(steps, step)
+
+		case "jumbo_fake", "jumbofake", "jumbo":
+			step := Step{
+				Action: ActionJumboFake,
+				Length: 1600,
+			}
+			if szStr, ok := namedArgs["size"]; ok {
+				step.Length, _ = strconv.Atoi(szStr)
+			} else if szStr, ok := namedArgs["len"]; ok {
+				step.Length, _ = strconv.Atoi(szStr)
+			} else if len(posArgs) > 0 {
+				step.Length, _ = strconv.Atoi(posArgs[0])
+			}
+			if step.Length < 1500 {
+				step.Length = 1500
+			}
+			if tStr, ok := namedArgs["ttl"]; ok {
+				step.TTL, _ = strconv.Atoi(tStr)
+			} else if len(posArgs) > 1 {
+				step.TTL, _ = strconv.Atoi(posArgs[1])
+			}
+			steps = append(steps, step)
+
+		case "ipopt_shift", "ipoptshift", "ipopt":
+			step := Step{
+				Action:    ActionIPOptShift,
+				Length:    40,
+				IPOptMode: "nop",
+			}
+			if szStr, ok := namedArgs["size"]; ok {
+				step.Length, _ = strconv.Atoi(szStr)
+			} else if szStr, ok := namedArgs["len"]; ok {
+				step.Length, _ = strconv.Atoi(szStr)
+			} else if len(posArgs) > 0 {
+				step.Length, _ = strconv.Atoi(posArgs[0])
+			}
+			step.Length = (step.Length / 4) * 4
+			if step.Length < 0 {
+				step.Length = 0
+			}
+			if step.Length > 40 {
+				step.Length = 40
+			}
+			if mode, ok := namedArgs["mode"]; ok {
+				step.IPOptMode = strings.ToLower(mode)
+			} else if len(posArgs) > 1 {
+				step.IPOptMode = strings.ToLower(posArgs[1])
+			}
+			switch step.IPOptMode {
+			case "nop", "ts", "rr":
+			case "none", "":
+				step.IPOptMode = "nop"
+			default:
+				return nil, fmt.Errorf("ipopt_shift: unsupported mode '%s'", step.IPOptMode)
+			}
 			steps = append(steps, step)
 
 		case "sleep", "delay":
@@ -403,13 +374,16 @@ func ParseStrategy(dsl string, defaultFakeTTL, defaultNormalTTL int) (*Strategy,
 			step.SleepDur = dur
 			steps = append(steps, step)
 
+		case "frag", "fragment", "fake_frag", "fakefrag", "fake_fragment":
+			return nil, fmt.Errorf("action '%s' requires a raw socket (CAP_NET_RAW) and is not available on non-rooted Android", actionName)
+
 		default:
 			return nil, fmt.Errorf("unknown strategy action '%s'", actionName)
 		}
 	}
 
 	if len(steps) == 0 {
-		return DefaultStrategy(defaultFakeTTL, defaultNormalTTL), nil
+		return DefaultUserspaceStrategy(), nil
 	}
 
 	return &Strategy{

@@ -77,8 +77,8 @@ func (peer *Peer) timersActive() bool {
 }
 
 func expiredRetransmitHandshake(peer *Peer) {
-	if peer.timers.handshakeAttempts.Load() > MaxTimerHandshakes {
-		peer.device.log.Verbosef("%s - Handshake did not complete after %d attempts, giving up", peer, MaxTimerHandshakes+2)
+	if peer.timers.handshakeAttempts.Load() > peer.device.maxHandshakeAttempts() {
+		peer.device.log.Verbosef("%s - Handshake did not complete after %d attempts, giving up", peer, peer.device.maxHandshakeAttempts()+2)
 
 		if peer.timersActive() {
 			peer.timers.sendKeepalive.Del()
@@ -96,11 +96,22 @@ func expiredRetransmitHandshake(peer *Peer) {
 			peer.timers.zeroKeyMaterial.Mod(RejectAfterTime * 3)
 		}
 	} else {
-		peer.timers.handshakeAttempts.Add(1)
-		peer.device.log.Verbosef("%s - Handshake did not complete after %d seconds, retrying (try %d)", peer, int(RekeyTimeout.Seconds()), peer.timers.handshakeAttempts.Load()+1)
+		attempt := peer.timers.handshakeAttempts.Add(1)
+		peer.device.log.Verbosef("%s - Handshake did not complete after %d seconds, retrying (try %d)", peer, int(peer.retransmitHandshakeTimeout().Seconds()), attempt+1)
 
 		/* We clear the endpoint address src address, in case this is the cause of trouble. */
 		peer.markEndpointSrcForClearing()
+
+		/* Mobile DPI/ISP devices often block a full UDP 4-tuple after a failed
+		 * handshake. Rotate the local port on retries when the port is dynamic;
+		 * the Android protect hook protects the new socket automatically. */
+		if attempt >= 2 {
+			if rotated, rotateErr := peer.device.RotatePort(); rotateErr != nil {
+				peer.device.log.Errorf("%s - Unable to rotate UDP port: %v", peer, rotateErr)
+			} else if rotated {
+				peer.device.log.Verbosef("%s - Rotated local UDP port after failed handshake", peer)
+			}
+		}
 
 		peer.SendHandshakeInitiation(true)
 	}
@@ -111,13 +122,13 @@ func expiredSendKeepalive(peer *Peer) {
 	if peer.timers.needAnotherKeepalive.Load() {
 		peer.timers.needAnotherKeepalive.Store(false)
 		if peer.timersActive() {
-			peer.timers.sendKeepalive.Mod(KeepaliveTimeout)
+			peer.timers.sendKeepalive.Mod(peer.sendKeepaliveTimeout())
 		}
 	}
 }
 
 func expiredNewHandshake(peer *Peer) {
-	peer.device.log.Verbosef("%s - Retrying handshake because we stopped hearing back after %d seconds", peer, int((KeepaliveTimeout + RekeyTimeout).Seconds()))
+	peer.device.log.Verbosef("%s - Retrying handshake because we stopped hearing back after %d seconds", peer, int(peer.newHandshakeTimeout().Seconds()))
 	/* We clear the endpoint address src address, in case this is the cause of trouble. */
 	peer.markEndpointSrcForClearing()
 	peer.SendHandshakeInitiation(false)
@@ -142,7 +153,7 @@ func expiredPersistentKeepalive(peer *Peer) {
 /* Should be called after an authenticated data packet is sent. */
 func (peer *Peer) timersDataSent() {
 	if peer.timersActive() && !peer.timers.newHandshake.IsPending() {
-		peer.timers.newHandshake.Mod(KeepaliveTimeout + RekeyTimeout + time.Millisecond*time.Duration(fastrandn(RekeyTimeoutJitterMaxMs)))
+		peer.timers.newHandshake.Mod(peer.newHandshakeTimeout() + time.Millisecond*time.Duration(fastrandn(RekeyTimeoutJitterMaxMs)))
 	}
 }
 
@@ -150,7 +161,7 @@ func (peer *Peer) timersDataSent() {
 func (peer *Peer) timersDataReceived() {
 	if peer.timersActive() {
 		if !peer.timers.sendKeepalive.IsPending() {
-			peer.timers.sendKeepalive.Mod(KeepaliveTimeout)
+			peer.timers.sendKeepalive.Mod(peer.sendKeepaliveTimeout())
 		} else {
 			peer.timers.needAnotherKeepalive.Store(true)
 		}
@@ -174,7 +185,7 @@ func (peer *Peer) timersAnyAuthenticatedPacketReceived() {
 /* Should be called after a handshake initiation message is sent. */
 func (peer *Peer) timersHandshakeInitiated() {
 	if peer.timersActive() {
-		peer.timers.retransmitHandshake.Mod(RekeyTimeout + time.Millisecond*time.Duration(fastrandn(RekeyTimeoutJitterMaxMs)))
+		peer.timers.retransmitHandshake.Mod(peer.retransmitHandshakeTimeout() + time.Millisecond*time.Duration(fastrandn(RekeyTimeoutJitterMaxMs)))
 	}
 }
 

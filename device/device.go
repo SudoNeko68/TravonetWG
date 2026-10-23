@@ -89,6 +89,45 @@ type Device struct {
 	ipcMutex sync.RWMutex
 	closed   chan struct{}
 	log      *Logger
+
+	// AmneziaWG wire-format obfuscation (see amnezia.go).
+	amnezia struct {
+		junk struct {
+			count atomic.Uint32
+			min   atomic.Uint32
+			max   atomic.Uint32
+		}
+		paddings struct {
+			init      atomic.Uint32
+			response  atomic.Uint32
+			cookie    atomic.Uint32
+			transport atomic.Uint32
+		}
+		headers struct {
+			init      AtomicUintRange
+			response  AtomicUintRange
+			cookie    AtomicUintRange
+			transport AtomicUintRange
+		}
+		signatures [5]atomic.Pointer[signaturePacket]
+
+		headerProtection struct {
+			sync.RWMutex
+			key HeaderCipherKey
+		}
+
+		contentPaddingAddition AtomicUintRange
+		randomTrailers         atomic.Bool
+		disableCookies         atomic.Bool
+
+		timings struct {
+			rekeyAfterTimeSec   AtomicUintRange
+			rekeyTimeoutSec     AtomicUintRange
+			rejectAfterTimeSec  AtomicUintRange
+			keepaliveTimeoutSec AtomicUintRange
+			maxHandshakeAttemps AtomicUintRange
+		}
+	}
 }
 
 // deviceState represents the state of a Device.
@@ -297,6 +336,7 @@ func NewDevice(tunDevice tun.Device, bind conn.Bind, logger *Logger) *Device {
 	device.peers.keyMap = make(map[NoisePublicKey]*Peer)
 	device.rate.limiter.Init()
 	device.indexTable.Init()
+	device.initAmnezia()
 
 	device.PopulatePools()
 
@@ -468,10 +508,48 @@ func (device *Device) BindSetMark(mark uint32) error {
 	return nil
 }
 
+// BindUpdate closes and reopens the bind, keeping the current UDP port.
 func (device *Device) BindUpdate() error {
 	device.net.Lock()
 	defer device.net.Unlock()
 
+	return device.bindUpdateLocked()
+}
+
+// RotatePort closes and reopens the bind on a new kernel-assigned UDP port.
+//
+// It only acts when the bind is using an ephemeral port (listen_port = 0). An
+// explicit listen_port is never changed behind the application's back, because
+// that would break inbound NAT mappings the user relies on. The new socket is
+// protected by the same control function as the old one, so this works inside
+// an Android VpnService without any additional privileges.
+//
+// It returns rotated=false (and a nil error) when no rotation was performed.
+func (device *Device) RotatePort() (rotated bool, err error) {
+	device.net.Lock()
+	defer device.net.Unlock()
+
+	if !device.isUp() || device.net.bind == nil {
+		return false, nil
+	}
+	binder, ok := device.net.bind.(interface{ IsAutoPort() bool })
+	if !ok || !binder.IsAutoPort() {
+		return false, nil
+	}
+
+	// Asking the kernel for port 0 is what actually guarantees a different
+	// 4-tuple: the previous port must not be requested again, otherwise the
+	// kernel hands back the very same mapping and rotation is a no-op.
+	device.net.port = 0
+	if err := device.bindUpdateLocked(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// bindUpdateLocked closes and reopens the bind. The caller must hold
+// device.net.
+func (device *Device) bindUpdateLocked() error {
 	// close existing sockets
 	if err := closeBindLocked(device); err != nil {
 		return err

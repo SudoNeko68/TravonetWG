@@ -7,6 +7,7 @@ package conn
 
 import (
 	"net"
+	"sync"
 	"syscall"
 )
 
@@ -25,6 +26,38 @@ type controlFn func(network, address string, c syscall.RawConn) error
 // controlFns is a list of functions that are called from the listen config
 // that can apply socket options.
 var controlFns = []controlFn{}
+
+// socketProtectorMu guards socketProtectorFn.
+var socketProtectorMu sync.RWMutex
+
+// socketProtectorFn is an optional callback used to protect a raw socket
+// descriptor from being routed back into the VPN tunnel. On Android this is
+// wired to VpnService.protect(fd) through the JNI layer.
+var socketProtectorFn func(fd int) error
+
+// SetSocketProtector registers the callback used to protect newly created
+// sockets (e.g. Android's VpnService.protect). Passing nil disables it.
+func SetSocketProtector(fn func(fd int) error) {
+	socketProtectorMu.Lock()
+	socketProtectorFn = fn
+	socketProtectorMu.Unlock()
+}
+
+// ProtectSocket asks the registered protector (if any) to protect fd. It is a
+// no-op when no protector is registered, so it is safe to call on every
+// platform.
+func ProtectSocket(fd int) error {
+	if fd < 0 {
+		return nil
+	}
+	socketProtectorMu.RLock()
+	fn := socketProtectorFn
+	socketProtectorMu.RUnlock()
+	if fn != nil {
+		return fn(fd)
+	}
+	return nil
+}
 
 // listenConfig returns a net.ListenConfig that applies the controlFns to the
 // socket prior to bind. This is used to apply socket buffer sizing and packet

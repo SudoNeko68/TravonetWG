@@ -21,7 +21,7 @@ func TestMeasureTargetTTL(t *testing.T) {
 	if totalHops < 3 {
 		t.Errorf("unexpected totalHops: %d", totalHops)
 	}
-	if fakeTTL < 3 || fakeTTL >= totalHops {
-		t.Errorf("invalid fakeTTL %d (must be between 3 and %d)", fakeTTL, totalHops)
+	if fakeTTL < 3 || fakeTTL > 8 {
+		t.Errorf("invalid fakeTTL %d (must be in the Android-safe range 3..8)", fakeTTL)
 	}
 }

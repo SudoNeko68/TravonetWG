@@ -57,6 +57,10 @@ type SOCKS5Server struct {
 	conns    map[net.Conn]struct{}
 	Username string
 	Password string
+
+	// Logf, when set, receives debug output instead of stdout. On Android
+	// stdout is discarded, so the backend routes it to logcat.
+	Logf func(string, ...interface{})
 }
 
 // NewSOCKS5Server creates a new SOCKS5 proxy server
@@ -76,21 +80,37 @@ func (s *SOCKS5Server) SetAuth(username, password string) {
 	s.Password = password
 }
 
-// ListenAndServe starts accepting incoming SOCKS5 connections
-func (s *SOCKS5Server) ListenAndServe() error {
+// Listen binds the SOCKS5 listener. It is separate from Serve so callers can
+// surface a bind error synchronously (wgStartSocks5 must not report success
+// before the port is actually bound). Calling it more than once is a no-op.
+func (s *SOCKS5Server) Listen() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.closed {
+		return errors.New("server is closed")
+	}
+	if s.listener != nil {
+		return nil
+	}
+
 	l, err := net.Listen("tcp", s.addr)
 	if err != nil {
 		return fmt.Errorf("failed to listen on %s: %w", s.addr, err)
 	}
-
-	s.mu.Lock()
-	if s.closed {
-		l.Close()
-		s.mu.Unlock()
-		return errors.New("server is closed")
-	}
 	s.listener = l
+	return nil
+}
+
+// Serve accepts connections on the listener created by Listen (or by
+// ListenAndServe). It returns nil once the server has been closed.
+func (s *SOCKS5Server) Serve() error {
+	s.mu.Lock()
+	l := s.listener
 	s.mu.Unlock()
+	if l == nil {
+		return errors.New("server is not listening")
+	}
 
 	for {
 		conn, err := l.Accept()
@@ -98,12 +118,15 @@ func (s *SOCKS5Server) ListenAndServe() error {
 			s.mu.Lock()
 			closed := s.closed
 			s.mu.Unlock()
-			if closed {
+			if closed || errors.Is(err, net.ErrClosed) {
 				return nil
 			}
 			return err
 		}
 
+		// Register the connection and the WaitGroup entry under the same lock
+		// that Close uses to set closed. This guarantees wg.Add never races
+		// with wg.Wait in Close.
 		s.mu.Lock()
 		if s.closed {
 			s.mu.Unlock()
@@ -111,9 +134,9 @@ func (s *SOCKS5Server) ListenAndServe() error {
 			return nil
 		}
 		s.conns[conn] = struct{}{}
+		s.wg.Add(1)
 		s.mu.Unlock()
 
-		s.wg.Add(1)
 		go func(c net.Conn) {
 			defer func() {
 				s.mu.Lock()
@@ -124,6 +147,27 @@ func (s *SOCKS5Server) ListenAndServe() error {
 			s.handleConnection(c)
 		}(conn)
 	}
+}
+
+// ListenAndServe binds the listener and starts accepting incoming SOCKS5
+// connections.
+func (s *SOCKS5Server) ListenAndServe() error {
+	if err := s.Listen(); err != nil {
+		return err
+	}
+	return s.Serve()
+}
+
+// debugf routes debug output through Logf when available.
+func (s *SOCKS5Server) debugf(format string, args ...interface{}) {
+	if !s.Debug {
+		return
+	}
+	if s.Logf != nil {
+		s.Logf(format, args...)
+		return
+	}
+	fmt.Printf(format, args...)
 }
 
 // Close gracefully stops the SOCKS5 server
@@ -196,7 +240,9 @@ func (s *SOCKS5Server) handleConnection(client net.Conn) {
 	}
 
 	s.mu.Lock()
-	requireAuth := s.Username != "" && s.Password != ""
+	// Fail closed: a half-configured credential pair must not silently turn the
+	// proxy into an open relay.
+	requireAuth := s.Username != "" || s.Password != ""
 	expectedUser := s.Username
 	expectedPass := s.Password
 	s.mu.Unlock()
@@ -337,17 +383,13 @@ func (s *SOCKS5Server) handleConnection(client net.Conn) {
 
 	remote, err := s.dialCtx(ctx, "tcp", targetAddr)
 	if err != nil {
-		if s.Debug {
-			fmt.Printf("DEBUG: (socks5) ❌ Dial to %s failed: %v\n", targetAddr, err)
-		}
+		s.debugf("DEBUG: (socks5) Dial to %s failed: %v\n", targetAddr, err)
 		sendReply(client, repConnectionRefused, nil, 0)
 		return
 	}
 	defer remote.Close()
 
-	if s.Debug {
-		fmt.Printf("DEBUG: (socks5) 🔗 Dialed %s successfully!\n", targetAddr)
-	}
+	s.debugf("DEBUG: (socks5) Dialed %s successfully\n", targetAddr)
 
 	// 4. Send Success Response
 	if err := sendReply(client, repSuccess, net.ParseIP("0.0.0.0"), 0); err != nil {

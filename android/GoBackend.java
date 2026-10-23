@@ -17,6 +17,12 @@ public final class GoBackend {
 
     private GoBackend() {}
 
+    // VpnService protection bridge (call wgSetVpnService or use wgTurnOnProtected
+    // so that UDP sockets are protected before the first handshake is sent).
+    public static native void wgSetVpnService(Object vpnService);
+    public static native int wgTurnOnProtected(String ifname, int tunFd, String settings, Object vpnService);
+    public static native void wgNotifySocketProtected(int handle);
+
     // WireGuard VPN methods (VpnService TUN mode)
     public static native int wgTurnOn(String ifname, int tunFd, String settings);
     public static native void wgTurnOff(int handle);
