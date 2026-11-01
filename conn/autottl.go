@@ -20,12 +20,12 @@ const (
 	// On cellular networks (LTE/5G), hops to the carrier border TSPU are often 4-6,
 	// so maxFakeTTL is expanded to 8.
 	minFakeTTL = 3
-	maxFakeTTL = 8
+	maxFakeTTL = 10
 
 	// maxProbeTTL bounds the AutoTTL probe. Beyond this distance the
 	// recommendation is already saturated, and mobile networks frequently
 	// filter ICMP entirely, so probing further only wastes battery.
-	maxProbeTTL = 14
+	maxProbeTTL = 16
 
 	// autoTTLDNSTimeout bounds name resolution inside the probe.
 	autoTTLDNSTimeout = 3 * time.Second
@@ -54,8 +54,10 @@ func lookupIPv4(host string) (net.IP, error) {
 // and calculates the optimal FakeTTL for DPI early-termination desync.
 //
 // On Android the distance is measured without root through IP_RECVERR /
-// MSG_ERRQUEUE, so no traceroute binary or CAP_NET_RAW is required. The probe
-// may take up to ~0.7s, so callers must not run it on a latency-sensitive
+// MSG_ERRQUEUE, so no traceroute binary or CAP_NET_RAW is required.
+// If ICMP Time Exceeded is filtered by the carrier (standard behavior on cellular
+// networks), it automatically falls back to an active DNS IP_RECVTTL probe.
+// The probe may take up to ~0.7s, so callers must not run it on a latency-sensitive
 // thread; the Android backend runs it in a goroutine after the tunnel is up.
 func MeasureTargetTTL(endpoint string) (totalHops int, recommendedFakeTTL int, err error) {
 	fallback := defaultFakeTTLForPlatform()
@@ -73,17 +75,29 @@ func MeasureTargetTTL(endpoint string) (totalHops int, recommendedFakeTTL int, e
 	if ip == nil {
 		resolved, lookupErr := lookupIPv4(host)
 		if lookupErr != nil {
+			if dnsHops, dnsErr := probeHopsViaDNS(); dnsErr == nil && dnsHops > 0 {
+				return dnsHops, recommendFakeTTL(dnsHops), nil
+			}
 			return 0, fallback, fmt.Errorf("failed to resolve endpoint %s: %w", host, lookupErr)
 		}
 		ip = resolved
 	}
 
-	hops, probeErr := measureTTLViaErrQueue(ip, port)
-	if probeErr != nil {
-		return 0, fallback, fmt.Errorf("kernel TTL probe unavailable: %w", probeErr)
+	var hops int
+	var probeErr error
+	if ip.To4() != nil {
+		hops, probeErr = measureTTLViaErrQueue(ip, port)
+	} else {
+		probeErr = fmt.Errorf("IPv6 target: errqueue not supported")
 	}
-	if hops <= 0 {
-		return 0, fallback, fmt.Errorf("kernel TTL probe returned no hops")
+
+	if probeErr != nil || hops <= 0 {
+		// On cellular networks (LTE/5G), intermediate routers drop ICMP Time Exceeded (Type 11).
+		// Fallback to DNS IP_RECVTTL probe to accurately measure cellular carrier hop distance.
+		if dnsHops, dnsErr := probeHopsViaDNS(); dnsErr == nil && dnsHops > 0 {
+			return dnsHops, recommendFakeTTL(dnsHops), nil
+		}
+		return 0, fallback, fmt.Errorf("kernel TTL probe unavailable: %w", probeErr)
 	}
 	return hops, recommendFakeTTL(hops), nil
 }
@@ -92,7 +106,7 @@ func MeasureTargetTTL(endpoint string) (totalHops int, recommendedFakeTTL int, e
 // fake packet must traverse the domestic DPI (TSPU) but expire before reaching
 // the foreign server. The Android-safe window is minFakeTTL..maxFakeTTL.
 func recommendFakeTTL(totalHops int) int {
-	recommended := totalHops - 4
+	recommended := totalHops - 3
 	if recommended < minFakeTTL {
 		recommended = minFakeTTL
 	}

@@ -36,4 +36,7 @@ public final class GoBackend {
     public static native void wgStopSocks5(int handle);
     public static native int wgGetSocks5SocketV4(int handle);
     public static native int wgGetSocks5SocketV6(int handle);
+
+    // Amnezia vpn:// URL decoder
+    public static native String wgParseVPNURL(String vpnUrl);
 }

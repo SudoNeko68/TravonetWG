@@ -914,12 +914,12 @@ func (tnet *Net) LookupContextHost(ctx context.Context, host string) ([]string, 
 			}
 		}
 	}
-	// We don't do RFC6724. Instead just put V6 addresses first if an IPv6 address is enabled
+	// Prioritize IPv4 addresses over IPv6.
 	var addrs []netip.Addr
-	if tnet.hasV6 {
-		addrs = append(addrsV6, addrsV4...)
-	} else {
+	if tnet.hasV4 {
 		addrs = append(addrsV4, addrsV6...)
+	} else {
+		addrs = append(addrsV6, addrsV4...)
 	}
 
 	if len(addrs) == 0 && lastErr != nil {

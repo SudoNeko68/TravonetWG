@@ -44,8 +44,8 @@ func createPingPacket(src, dst netip.Addr) []byte {
 	icmp := pkt[20:]
 
 	// ICMP Echo Request
-	icmp[0] = 8 // Echo Request
-	icmp[1] = 0 // Code
+	icmp[0] = 8                                   // Echo Request
+	icmp[1] = 0                                   // Code
 	binary.BigEndian.PutUint16(icmp[4:6], 0x1234) // ID
 	binary.BigEndian.PutUint16(icmp[6:8], 1)      // Sequence
 	copy(icmp[8:], []byte("TESTPING"))

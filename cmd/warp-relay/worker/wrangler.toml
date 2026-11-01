@@ -1,0 +1,4 @@
+name = "travonet-warp-relay"
+main = "warp-relay.js"
+compatibility_date = "2026-10-22"
+workers_dev = true

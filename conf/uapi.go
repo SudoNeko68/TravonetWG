@@ -179,8 +179,9 @@ func FilterUAPI(settings string) (cleanUAPI string, ev UAPIEvasion) {
 
 		case "endpoint":
 			curEndpoint = val
-			ev.Endpoint = val
-			out = append(out, "endpoint="+ResolveEndpointHostPort(val))
+			resolved := ResolveEndpointHostPort(val)
+			ev.Endpoint = resolved
+			out = append(out, "endpoint="+resolved)
 			continue
 
 		case "persistent_keepalive_interval", "persistentkeepalive":

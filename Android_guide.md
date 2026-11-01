@@ -44,13 +44,6 @@ public final class GoBackend {
 
     // Режим VpnService TUN
     public static native int wgTurnOn(String ifname, int tunFd, String settings);
-    // Рекомендуемый безопасный запуск: VpnService.protect(fd) применяется к
-    // каждому UDP-сокету ещё до bind() и до первого Handshake.
-    public static native int wgTurnOnProtected(String ifname, int tunFd, String settings, Object vpnService);
-    // Регистрация VpnService до wgTurnOn (альтернатива wgTurnOnProtected).
-    public static native void wgSetVpnService(Object vpnService);
-    // Ручное подтверждение защиты сокета для legacy-сценария.
-    public static native void wgNotifySocketProtected(int handle);
     public static native void wgTurnOff(int handle);
     public static native int wgGetSocketV4(int handle);
     public static native int wgGetSocketV6(int handle);
@@ -86,32 +79,18 @@ public final class GoBackend {
    int tunFd = pfd.detachFd();
    ```
 
-2. **Запуск туннеля с защитой сокетов (рекомендуется):**
-
-   Передайте `VpnService` прямо в нативный слой. Тогда `VpnService.protect(fd)`
-   вызывается для каждого UDP-сокета **до** `bind()` и до отправки первого
-   Handshake, поэтому петля маршрутизации `0.0.0.0/0 -> tun0` невозможна:
+2. **Запуск туннеля (`wgTurnOn`):**
+   Передайте имя интерфейса, дескриптор TUN и конфигурацию (строка `.conf` или WireGuard UAPI):
 
    ```java
-   // Вариант A: защита при создании сокетов
-   int tunnelHandle = GoBackend.wgTurnOnProtected("wg0", tunFd, configContent, vpnService);
-
-   // Вариант B: зарегистрировать VpnService заранее
-   GoBackend.wgSetVpnService(vpnService);
    int tunnelHandle = GoBackend.wgTurnOn("wg0", tunFd, configContent);
-
    if (tunnelHandle < 0) {
        // Ошибка инициализации туннеля, tunFd закрывается автоматически в Go
    }
    ```
 
-   `wgSetVpnService(null)` отключает защиту (например, при уничтожении сервиса).
-
-3. **Legacy-совместимость (`wgGetSocketV4/V6` + `protect`):**
-
-   Если клиент нельзя изменить, используйте прежнюю схему. Нативная библиотека
-   автоматически приостанавливает первый send до 300 мс, чтобы приложение успело
-   защитить сокет:
+3. **Защита сокетов от петли маршрутизации (`protect`):**
+   Сразу после вызова `wgTurnOn` получите дескрипторы открытых UDP-сокетов ядра и защитите их:
 
    ```java
    int fd4 = GoBackend.wgGetSocketV4(tunnelHandle);
@@ -123,13 +102,7 @@ public final class GoBackend {
    if (fd6 > 0) {
        vpnService.protect(fd6);
    }
-
-   // Необязательно, но ускоряет старт: снять барьер сразу после protect().
-   GoBackend.wgNotifySocketProtected(tunnelHandle);
    ```
-
-   Барьер снимается автоматически через 300 мс, поэтому приложение, которое
-   вообще не вызывает `protect`, не блокирует трафик навсегда.
 
 4. **Получение метрик и статистики (`wgGetConfig`):**
    Возвращает UAPI-дамп с текущими счетчиками переданного/принятого трафика (`rx_bytes`, `tx_bytes`) и временем последнего рукопожатия (`last_handshake_time_sec`):
@@ -180,10 +153,10 @@ DNS = 1.1.1.1
 MTU = 1280
 
 # Параметры десинхронизации TravonetWG:
-Strategy = default-userspace # default, default-userspace, fake или DSL
+Strategy = fake,ipfrag2       # Стратегии: fake, ipfrag2, split2, fake,split2, или DSL цепочка
 FakeTTL = auto                # auto для зондирования хопов, либо число (обычно 3-10)
 PreJunk = 64                  # Размер мусорного UDP-пакета перед Handshake (0 для отключения)
-NormalTTL = 64                # TTL легитимного Handshake и трафика (по умолчанию 64)
+NormalTTL = 64                # Базовый TTL для легитимных пакетов (по умолчанию 64)
 
 [Peer]
 PublicKey = <Public_Key>
@@ -193,60 +166,18 @@ PersistentKeepalive = 5       # В мобильных сетях и при ис�
                               # рекомендуется интервал 5-10 сек для предотвращения сброса NAT/ALG
 ```
 
-Дополнительно поддерживаются AmneziaWG-параметры (AWG 1.5/2.0): `Jc`, `Jmin`,
-`Jmax`, `S1`–`S4`, `H1`–`H4` и `I1`–`I5`. Они передаются в UAPI и реализуются
-на уровне wire-формата: junk-пакеты перед рукопожатием, случайный padding,
-magic headers (включая диапазоны `a-b`) и signature-пакеты. Если параметры не
-заданы, устройство работает как обычный WireGuard-клиент.
-
-### Пользовательский конвейер DSL
-
+Также поддерживается синтаксис конвейера DSL:
 ```ini
-Strategy = junk(64) -> mimic(quic) -> fake_udp(148, ttl=5) -> sleep(2ms)
+Strategy = junk(64) -> fake_udp(148) -> frag(8) -> frag(148)
 ```
-
-Действия, доступные без root и без `CAP_NET_RAW`:
-
-| Действие | Описание |
-|---|---|
-| `junk(size[, ttl])` | Случайный UDP-пакет перед Handshake |
-| `mimic(stun\|quic\|dns[, ttl=...])` | Маскировка под STUN/QUIC/DNS |
-| `jumbo_fake(size=1600[, ttl=...])` | UDP-пакет > MTU, ядро фрагментирует его на L3 (MF=1 + MF=0) |
-| `fake_udp(size=148[, ttl=..., ipopt=ts\|rr\|nop, corrupt=true])` | Фейковый Handshake; `corrupt=true` убирает сигнатуру `0x01` |
-| `ipopt_shift(size[, mode=ts\|rr\|nop])` | Сдвиг IPv4-заголовка через `IP_OPTIONS` на нечётных попытках |
-| `sleep(2ms)` | Пауза между пакетами |
-
-Действия `frag()` / `fake_frag()` и `badsum=true` требуют raw-сокет и на
-нерутованном Android недоступны. Если они указаны в стратегии, движок пишет
-предупреждение и использует `default-userspace`.
 
 ---
 
-## 6. Особенности исполнения на Android
+## 6. Особенности исполнения на Android (Root vs Non-Root)
 
-- **Только userspace, без root:**
-  Сырые сокеты (`AF_INET, SOCK_RAW`, `CAP_NET_RAW`) не используются вообще.
-  `EvasionBind` всегда работает через обычный UDP-сокет и конвейер:
-  `mimic(quic) → mimic(stun) → jumbo_fake(1600) → fake_udp(148, corrupt, ipopt=ts) → sleep(2ms)`.
-  TTL задаётся атомарно через `sendmsg()` + `cmsg IP_TTL` для каждого пакета,
-  поэтому легитимный трафик не получает низкий TTL. `jumbo_fake` отправляется
-  обычным UDP-сокетом с `IP_MTU_DISCOVER=DONT`, и ядро само выполняет L3-IPv4-
-  фрагментацию. `ipopt_shift` применяет `IP_OPTIONS` (`ts`/`rr`) на нечётных
-  попытках Handshake и сбрасывает их сразу после отправки.
-- **Auto-TTL без traceroute:**
-  На Android расстояние до сервера измеряется через `IP_RECVERR` / `MSG_ERRQUEUE`
-  не требующим root сокетом. `FakeTTL` вычисляется как `hops - 4` и
-  ограничивается диапазоном `3..7`; если ICMP заблокирован, используется
-  безопасное значение `5`.
-- **Ротация порта:**
-  Если Handshake не завершился, начиная со второй повторной попытки локальный
-  UDP-порт переоткрывается (`BindUpdate`), чтобы обойти блокировку полного
-  4-tuple на стороне DPI/оператора. Новый сокет автоматически защищается тем же
-  механизмом `VpnService.protect`.
-- **MTU и SELinux:**
-  MTU берётся из `VpnService.Builder` (по умолчанию 1280) и применяется через
-  `Device.SetMTU` без ioctl. Если `TUNGETIFF`/`SIOCGIFMTU` запрещены SELinux,
-  `tun`-слой использует безопасные значения (`tun0`, MTU 1280, batchSize 1).
+- **Без root-прав (стандартный режим):**
+  Попытка создания сырого сокета (`AF_INET, SOCK_RAW`) завершается ошибкой `EACCES` (`Permission denied`). Движок `EvasionBind` автоматически переключается на непривилегированную десинхронизацию: манипуляцию `IP_TTL` на стандартном UDP-сокете через `setsockopt(IPPROTO_IP, IP_TTL, fakeTTL)` и отправку `pre-junk`. Все функции работают в пользовательском пространстве.
+- **При наличии root-прав (`CAP_NET_RAW`):**
+  Активируется полный стек L3-фрагментации на сырых сокетах с флагами `IP_NODEFRAG` и ручной нарезкой IP-заголовков.
 - **Логирование:**
-  Все диагностические сообщения выводятся в Logcat под тегами
-  `TravonetWG/<InterfaceName>` и `TravonetWG/SOCKS5`.
+  Все диагностические сообщения выводятся в Logcat под тегами `TravonetWG/<InterfaceName>` и `TravonetWG/SOCKS5`.

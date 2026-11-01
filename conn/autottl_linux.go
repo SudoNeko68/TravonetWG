@@ -213,3 +213,112 @@ func readRecvErr(fd int) (sockExtendedErr, bool, error) {
 	}
 	return ee, false, nil
 }
+
+// probeHopsViaDNS measures network hops to public anycast DNS resolvers (1.1.1.1, 8.8.8.8, 77.88.8.8)
+// using UDP and IP_RECVTTL. This works on cellular networks (LTE/5G) where ICMP Time Exceeded is blocked.
+func probeHopsViaDNS() (int, error) {
+	resolvers := []string{
+		"1.1.1.1",
+		"8.8.8.8",
+		"77.88.8.8",
+	}
+
+	var lastErr error
+	for _, ipStr := range resolvers {
+		hops, err := probeSingleDNSResolver(ipStr)
+		if err == nil && hops > 0 {
+			return hops, nil
+		}
+		lastErr = err
+	}
+	if lastErr != nil {
+		return 0, lastErr
+	}
+	return 0, errors.New("no responses received from DNS resolvers")
+}
+
+func probeSingleDNSResolver(resolverIP string) (int, error) {
+	ip := net.ParseIP(resolverIP).To4()
+	if ip == nil {
+		return 0, errors.New("invalid IPv4 address")
+	}
+
+	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC|unix.SOCK_NONBLOCK, unix.IPPROTO_UDP)
+	if err != nil {
+		return 0, err
+	}
+	defer unix.Close(fd)
+
+	_ = ProtectSocket(fd)
+
+	if err := unix.SetsockoptInt(fd, unix.IPPROTO_IP, unix.IP_RECVTTL, 1); err != nil {
+		return 0, err
+	}
+
+	// Standard DNS query for root "." type NS with recursion desired
+	pkt := []byte{
+		0xAB, 0xCD, // ID
+		0x01, 0x00, // Standard query, recursion desired
+		0x00, 0x01, // QDCOUNT = 1
+		0x00, 0x00, // ANCOUNT = 0
+		0x00, 0x00, // NSCOUNT = 0
+		0x00, 0x00, // ARCOUNT = 0
+		0x00,       // root domain name "."
+		0x00, 0x02, // QTYPE = NS
+		0x00, 0x01, // QCLASS = IN
+	}
+
+	var sa unix.SockaddrInet4
+	sa.Port = 53
+	copy(sa.Addr[:], ip)
+
+	if err := unix.Sendto(fd, pkt, 0, &sa); err != nil {
+		return 0, err
+	}
+
+	pfd := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}
+	n, err := unix.Poll(pfd, 800) // 800ms timeout per resolver
+	if err != nil {
+		return 0, err
+	}
+	if n == 0 {
+		return 0, errors.New("timeout waiting for DNS response")
+	}
+
+	buf := make([]byte, 1500)
+	oob := make([]byte, 256)
+	_, oobn, _, _, err := unix.Recvmsg(fd, buf, oob, 0)
+	if err != nil {
+		return 0, err
+	}
+
+	cmsgs, err := unix.ParseSocketControlMessage(oob[:oobn])
+	if err != nil {
+		return 0, err
+	}
+	for _, cm := range cmsgs {
+		if cm.Header.Level == unix.IPPROTO_IP && cm.Header.Type == unix.IP_TTL {
+			var inTTL int
+			if len(cm.Data) >= 4 {
+				inTTL = int(binary.NativeEndian.Uint32(cm.Data[:4]))
+			} else if len(cm.Data) >= 1 {
+				inTTL = int(cm.Data[0])
+			}
+			if inTTL <= 0 || inTTL > 255 {
+				continue
+			}
+			baseTTL := 64
+			if inTTL > 64 && inTTL <= 128 {
+				baseTTL = 128
+			} else if inTTL > 128 {
+				baseTTL = 255
+			}
+			hops := baseTTL - inTTL
+			if hops < 1 {
+				hops = 1
+			}
+			return hops, nil
+		}
+	}
+	return 0, errors.New("no IP_TTL control message in DNS response")
+}

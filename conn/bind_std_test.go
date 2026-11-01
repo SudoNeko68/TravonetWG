@@ -248,3 +248,14 @@ func Test_splitCoalescedMessages(t *testing.T) {
 		})
 	}
 }
+
+func TestParseEndpointDomainPrioritizesIPv4(t *testing.T) {
+	bind := NewStdNetBind()
+	ep, err := bind.ParseEndpoint("one.one.one.one:51820")
+	if err != nil {
+		t.Skipf("ParseEndpoint failed (network/DNS): %v", err)
+	}
+	if !ep.DstIP().Is4() {
+		t.Errorf("expected parsed endpoint IP to be IPv4, got %v", ep.DstIP())
+	}
+}

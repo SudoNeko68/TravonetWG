@@ -222,6 +222,48 @@ Address = 172.16.0.2/32
 	}
 }
 
+func TestExplicitZeroPreJunkIsHonored(t *testing.T) {
+	cfg, err := ParseConfigString(`[Interface]
+PrivateKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+Address = 172.16.0.2/32
+PreJunk = 0
+Jmin = 50
+
+[Peer]
+PublicKey = BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=
+Endpoint = 1.2.3.4:2408
+AllowedIPs = 0.0.0.0/0
+`)
+	if err != nil {
+		t.Fatalf("ParseConfigString failed: %v", err)
+	}
+	if !cfg.PreJunkSet {
+		t.Fatal("PreJunkSet must be true for an explicit PreJunk key")
+	}
+	if cfg.PreJunkSize != 0 {
+		t.Fatalf("explicit PreJunk = 0 was overridden by Jmin: %d", cfg.PreJunkSize)
+	}
+}
+
+func TestAmneziaJminSetsPreJunkWhenPreJunkIsOmitted(t *testing.T) {
+	cfg, err := ParseConfigString(`[Interface]
+PrivateKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+Address = 172.16.0.2/32
+Jmin = 50
+
+[Peer]
+PublicKey = BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=
+Endpoint = 1.2.3.4:2408
+AllowedIPs = 0.0.0.0/0
+`)
+	if err != nil {
+		t.Fatalf("ParseConfigString failed: %v", err)
+	}
+	if !cfg.PreJunkSet || cfg.PreJunkSize != 50 {
+		t.Fatalf("Jmin must set PreJunkSize when PreJunk is omitted: set=%v size=%d", cfg.PreJunkSet, cfg.PreJunkSize)
+	}
+}
+
 func TestAmneziaConfigParsing(t *testing.T) {
 	confContent := `[Interface]
 PrivateKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
@@ -306,5 +348,52 @@ AllowedIPs = 0.0.0.0/0
 		if !strings.Contains(uapi, expected) {
 			t.Errorf("ToUAPI missing %q:\n%s", expected, uapi)
 		}
+	}
+}
+
+func TestWarpReservedRoundTrip(t *testing.T) {
+	content := `[Interface]
+PrivateKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+Address = 172.16.0.2/32
+Reserved = 104, 157, 231
+
+[Peer]
+PublicKey = BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=
+Endpoint = 162.159.192.6:2408
+AllowedIPs = 0.0.0.0/0
+`
+	parsed, err := ParseConfigString(content)
+	if err != nil {
+		t.Fatalf("ParseConfigString: %v", err)
+	}
+	if parsed.Reserved != "104, 157, 231" {
+		t.Fatalf("Reserved = %q; want %q", parsed.Reserved, "104, 157, 231")
+	}
+	uapi, err := parsed.ToUAPI()
+	if err != nil {
+		t.Fatalf("ToUAPI: %v", err)
+	}
+	if !strings.Contains(uapi, "reserved=104, 157, 231\n") {
+		t.Fatalf("UAPI does not contain reserved bytes:\n%s", uapi)
+	}
+}
+
+func TestFilterUAPIKeepsReserved(t *testing.T) {
+	clean, _ := FilterUAPI("private_key=AAAA\nreserved=104, 157, 231\npublic_key=BBBB\nallowed_ip=0.0.0.0/0\n")
+	if !strings.Contains(clean, "reserved=104, 157, 231\n") {
+		t.Fatalf("FilterUAPI dropped reserved bytes:\n%s", clean)
+	}
+}
+
+func TestLookupHostIPsPrioritizesIPv4(t *testing.T) {
+	ips, err := LookupHostIPs("one.one.one.one")
+	if err != nil {
+		t.Skipf("DNS lookup failed: %v", err)
+	}
+	if len(ips) == 0 {
+		t.Fatalf("no IPs returned for one.one.one.one")
+	}
+	if ips[0].To4() == nil {
+		t.Errorf("expected first IP to be IPv4, got %v", ips[0])
 	}
 }

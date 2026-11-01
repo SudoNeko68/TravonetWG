@@ -23,6 +23,7 @@ extern void wgNotifySocketProtected(int handle);
 import "C"
 
 import (
+	"encoding/json"
 	"fmt"
 	"math"
 	"net"
@@ -134,7 +135,7 @@ func parseSettings(settings string, logger *device.Logger) (cleanUapi string, ev
 		if parsed.NormalTTL > 0 {
 			evasionCfg.NormalTTL = parsed.NormalTTL
 		}
-		if parsed.PreJunkSize > 0 {
+		if parsed.PreJunkSet || parsed.PreJunkSize > 0 {
 			evasionCfg.PreJunkSize = parsed.PreJunkSize
 		}
 		if parsed.NoEvasion {
@@ -604,6 +605,29 @@ func wgGetSocks5SocketV6(socksHandle int32) int32 {
 		return -1
 	}
 	return int32(fd)
+}
+
+//export wgParseVPNURL
+func wgParseVPNURL(vpnURL *C.char) *C.char {
+	if vpnURL == nil {
+		return C.CString("ERROR: nil vpnURL")
+	}
+	cfgText, name, err := conf.ParseVPNURL(C.GoString(vpnURL))
+	if err != nil {
+		return C.CString("ERROR: " + err.Error())
+	}
+	resp := struct {
+		Name   string `json:"name"`
+		Config string `json:"config"`
+	}{
+		Name:   name,
+		Config: cfgText,
+	}
+	b, err := json.Marshal(resp)
+	if err != nil {
+		return C.CString("ERROR: " + err.Error())
+	}
+	return C.CString(string(b))
 }
 
 func main() {}

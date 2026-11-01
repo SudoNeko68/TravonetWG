@@ -290,6 +290,12 @@ func (device *Device) CreateMessageInitiation(peer *Peer) (*MessageInitiation, e
 		Type:      device.amnezia.headers.init.PickOne(),
 		Ephemeral: handshake.localEphemeral.publicKey(),
 	}
+	// Cloudflare WARP uses the three reserved bytes of the initiation header
+	// as the client id returned during registration. Keep the message type in
+	// the low byte and place the id in the next three bytes.
+	if reserved := device.reserved.Load(); reserved != 0 {
+		msg.Type = (msg.Type & 0xff) | (reserved << 8)
+	}
 
 	handshake.mixKey(msg.Ephemeral[:])
 	handshake.mixHash(msg.Ephemeral[:])

@@ -97,6 +97,10 @@ func (device *Device) IpcGetOperation(w io.Writer) error {
 			sendf("fwmark=%d", device.net.fwmark)
 		}
 
+		if reserved := device.reserved.Load(); reserved != 0 {
+			sendf("reserved=%06x", reserved)
+		}
+
 		// AmneziaWG obfuscation parameters.
 		if count := device.amnezia.junk.count.Load(); count != 0 {
 			sendf("jc=%d", count)
@@ -273,6 +277,14 @@ func (device *Device) handleDeviceLine(key, value string) error {
 		}
 		device.log.Verbosef("UAPI: Updating private key")
 		device.SetPrivateKey(sk)
+
+	case "reserved":
+		reserved, err := parseReservedValue(value)
+		if err != nil {
+			return ipcErrorf(ipc.IpcErrorInvalid, "failed to parse reserved: %w", err)
+		}
+		device.log.Verbosef("UAPI: Updating WARP reserved client id")
+		device.reserved.Store(reserved)
 
 	case "listen_port":
 		port, err := strconv.ParseUint(value, 10, 16)
@@ -700,4 +712,40 @@ func (device *Device) IpcHandle(socket net.Conn) {
 		}
 		buffered.Flush()
 	}
+}
+
+// parseReservedValue accepts either a 24-bit hex value ("689de7") or the
+// three-byte decimal/hex form used by WARP configs ("104, 157, 231").
+func parseReservedValue(value string) (uint32, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0, nil
+	}
+	if strings.Contains(value, ",") {
+		parts := strings.Split(value, ",")
+		if len(parts) != 3 {
+			return 0, fmt.Errorf("expected three bytes, got %d", len(parts))
+		}
+		var out uint32
+		for i, part := range parts {
+			part = strings.TrimSpace(part)
+			base := 10
+			if strings.HasPrefix(part, "0x") || strings.HasPrefix(part, "0X") {
+				part = part[2:]
+				base = 16
+			}
+			byteValue, err := strconv.ParseUint(part, base, 8)
+			if err != nil {
+				return 0, fmt.Errorf("byte %d: %w", i, err)
+			}
+			out |= uint32(byteValue) << (8 * i)
+		}
+		return out, nil
+	}
+	value = strings.TrimPrefix(strings.TrimPrefix(value, "0x"), "0X")
+	reserved, err := strconv.ParseUint(value, 16, 24)
+	if err != nil {
+		return 0, err
+	}
+	return uint32(reserved), nil
 }

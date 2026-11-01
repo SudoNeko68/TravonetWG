@@ -49,16 +49,20 @@ func buildSTUNRequest() []byte {
 func buildQUICInitial() []byte {
 	pkt := make([]byte, quicPacketSize)
 	randRead(pkt)
-	pkt[0] = 0xC0 | (pkt[0] & 0x0F) // Long Header + Fixed Bit + Initial
-	pkt[1] = 0x00                   // Version 1
+	// Long Header (0x80) + Fixed Bit (0x40) + type Initial (0x00) + reserved
+	// bits 0 + packet number length 1 (0x00).
+	pkt[0] = 0xC0
+	pkt[1] = 0x00 // Version 1
 	pkt[2] = 0x00
 	pkt[3] = 0x00
 	pkt[4] = 0x01
 	pkt[5] = 0x08  // DCID length
 	pkt[14] = 0x08 // SCID length
 	pkt[23] = 0x00 // Token length
-	pkt[24] = 0x44 // VarInt length (0x44A4 = 1188)
-	pkt[25] = 0xA4
+	// Length varint: everything after this field (1200 - 26 = 1174), encoded as
+	// a two-byte QUIC varint (0x4000 | 1174 = 0x4496).
+	pkt[24] = 0x44
+	pkt[25] = 0x96
 	return pkt
 }
 

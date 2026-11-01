@@ -35,15 +35,22 @@ type Config struct {
 	MTU        int
 	ListenPort int
 
+	// WARP/Cloudflare reserved client id (three bytes in the handshake header).
+	Reserved string
+
 	// Evasion settings in [Interface]
 	Strategy    string
 	FakeTTL     int
 	NormalTTL   int
 	PreJunkSize int
-	Socks5      string
-	SocksAuth   string
-	NoEvasion   bool
-	Debug       bool
+	// PreJunkSet records that PreJunkSize was set explicitly (PreJunk or the
+	// AmneziaWG Jmin alias). Without it, an explicit "PreJunk = 0" is
+	// indistinguishable from an omitted key and would fall back to the default.
+	PreJunkSet bool
+	Socks5     string
+	SocksAuth  string
+	NoEvasion  bool
+	Debug      bool
 	// DebugSet records that the config contained an explicit Debug key, so a
 	// deliberate "Debug = false" can override the default verbose logging.
 	DebugSet bool
@@ -96,8 +103,16 @@ func ParseConfigFile(path string) (*Config, error) {
 	return ParseConfig(file)
 }
 
-// ParseConfigString parses a WireGuard .conf formatted string
+// ParseConfigString parses a WireGuard .conf formatted string or a vpn:// Amnezia URL
 func ParseConfigString(content string) (*Config, error) {
+	trimmed := strings.TrimSpace(content)
+	if strings.HasPrefix(strings.ToLower(trimmed), "vpn://") {
+		cfgText, _, err := ParseVPNURL(trimmed)
+		if err != nil {
+			return nil, fmt.Errorf("parse vpn:// URL: %w", err)
+		}
+		return ParseConfig(strings.NewReader(cfgText))
+	}
 	return ParseConfig(strings.NewReader(content))
 }
 
@@ -164,6 +179,8 @@ func ParseConfig(r io.Reader) (*Config, error) {
 				if mtu, err := strconv.Atoi(val); err == nil && mtu > 0 {
 					cfg.MTU = mtu
 				}
+			case "reserved":
+				cfg.Reserved = val
 			case "listenport":
 				if lp, err := strconv.Atoi(val); err == nil {
 					cfg.ListenPort = lp
@@ -179,6 +196,7 @@ func ParseConfig(r io.Reader) (*Config, error) {
 			case "prejunk", "pre_junk", "prejunksize":
 				if sz, err := strconv.Atoi(val); err == nil {
 					cfg.PreJunkSize = sz
+					cfg.PreJunkSet = true
 				}
 			case "normalttl", "normal_ttl":
 				if ttl, err := strconv.Atoi(val); err == nil && ttl > 0 {
@@ -192,8 +210,9 @@ func ParseConfig(r io.Reader) (*Config, error) {
 				if v, err := strconv.Atoi(val); err == nil && v >= 0 {
 					cfg.Jmin = v
 				}
-				if sz, err := strconv.Atoi(val); err == nil && cfg.PreJunkSize == 0 {
+				if sz, err := strconv.Atoi(val); err == nil && sz >= 0 && !cfg.PreJunkSet {
 					cfg.PreJunkSize = sz
+					cfg.PreJunkSet = true
 				}
 			case "jmax":
 				if v, err := strconv.Atoi(val); err == nil && v >= 0 {
@@ -325,7 +344,7 @@ func ParseConfig(r io.Reader) (*Config, error) {
 	cfg.Peers = peers
 	if len(peers) > 0 {
 		cfg.PublicKey = peers[0].PublicKey
-		cfg.Endpoint = peers[0].Endpoint
+		cfg.Endpoint = ResolveEndpointHostPort(peers[0].Endpoint)
 		cfg.AllowedIPs = peers[0].AllowedIPs
 		cfg.PersistentKeepalive = peers[0].PersistentKeepalive
 	} else {
@@ -358,19 +377,41 @@ func IsPort500Endpoint(endpoint string) bool {
 const dnsLookupTimeout = 3 * time.Second
 
 // LookupHostIPs resolves a hostname with a bounded timeout and returns every
-// address advertised for it.
+// address advertised for it, prioritizing IPv4 addresses.
 func LookupHostIPs(host string) ([]net.IP, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), dnsLookupTimeout)
 	defer cancel()
 
-	addrs, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
-	if err != nil {
-		return nil, err
+	var ips []net.IP
+
+	// Query IPv4 first to prioritize IPv4 over IPv6
+	if addrs4, err := net.DefaultResolver.LookupNetIP(ctx, "ip4", host); err == nil {
+		for _, addr := range addrs4 {
+			if addr.Is4() {
+				ips = append(ips, net.IP(addr.AsSlice()))
+			}
+		}
 	}
-	ips := make([]net.IP, 0, len(addrs))
-	for _, addr := range addrs {
-		ips = append(ips, net.IP(addr.AsSlice()))
+
+	// Query IPv6 and append as fallback
+	if addrs6, err := net.DefaultResolver.LookupNetIP(ctx, "ip6", host); err == nil {
+		for _, addr := range addrs6 {
+			if addr.Is6() {
+				ips = append(ips, net.IP(addr.AsSlice()))
+			}
+		}
 	}
+
+	if len(ips) == 0 {
+		addrs, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+		if err != nil {
+			return nil, err
+		}
+		for _, addr := range addrs {
+			ips = append(ips, net.IP(addr.AsSlice()))
+		}
+	}
+
 	if len(ips) == 0 {
 		return nil, fmt.Errorf("no addresses found for %s", host)
 	}
@@ -424,6 +465,10 @@ func (c *Config) ToUAPI() (string, error) {
 		return "", fmt.Errorf("invalid PrivateKey (must be 32-byte base64): %v", err)
 	}
 	sb.WriteString(fmt.Sprintf("private_key=%s\n", hex.EncodeToString(privBytes)))
+
+	if c.Reserved != "" {
+		sb.WriteString(fmt.Sprintf("reserved=%s\n", c.Reserved))
+	}
 
 	if c.ListenPort > 0 {
 		sb.WriteString(fmt.Sprintf("listen_port=%d\n", c.ListenPort))

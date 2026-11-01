@@ -1,22 +1,34 @@
+PREFIX ?= /usr
+DESTDIR ?=
+BINDIR ?= $(PREFIX)/bin
 export GO111MODULE := on
+
+all: generate-version-and-build
+
 MAKEFLAGS += --no-print-directory
 
-ANDROID_NDK_HOME ?=
-GO_BIN ?= go
+generate-version-and-build:
+	@export GIT_CEILING_DIRECTORIES="$(realpath $(CURDIR)/..)" && \
+	tag="$$(git describe --dirty 2>/dev/null)" && \
+	ver="$$(printf 'package main\n\nconst Version = "%s"\n' "$$tag")" && \
+	[ "$$(cat version.go 2>/dev/null)" != "$$ver" ] && \
+	echo "$$ver" > version.go && \
+	git update-index --assume-unchanged version.go || true
+	@$(MAKE) wireguard-go
 
-.PHONY: all android test vet clean
+wireguard-go: $(wildcard *.go) $(wildcard */*.go)
+	go build -v -o "$@"
 
-all: android
-
-android:
-	GO_BIN="$(GO_BIN)" ANDROID_NDK_HOME="$(ANDROID_NDK_HOME)" ./build-android.sh
+install: wireguard-go
+	@install -v -d "$(DESTDIR)$(BINDIR)" && install -v -m 0755 "$<" "$(DESTDIR)$(BINDIR)/wireguard-go"
 
 test:
-	$(GO_BIN) test ./conf ./conn ./proxy
-
-vet:
-	$(GO_BIN) vet ./...
+	go test ./...
 
 clean:
-	rm -rf build/android
+	rm -f wireguard-go
 
+android:
+	./build-android.sh
+
+.PHONY: all clean test install generate-version-and-build android

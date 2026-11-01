@@ -90,6 +90,11 @@ type Device struct {
 	closed   chan struct{}
 	log      *Logger
 
+	// WARP/Cloudflare repurposes the three reserved bytes in the WireGuard
+	// handshake initiation header as a 24-bit client id. They are zero for
+	// ordinary WireGuard peers.
+	reserved atomic.Uint32
+
 	// AmneziaWG wire-format obfuscation (see amnezia.go).
 	amnezia struct {
 		junk struct {

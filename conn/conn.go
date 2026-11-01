@@ -75,6 +75,7 @@ type PeekLookAtSocketFd interface {
 // socket TTL at runtime for unprivileged userspace desync.
 type SocketTTLController interface {
 	SetIPv4TTL(ttl int) error
+	SetIPv6HopLimit(hops int) error
 }
 
 // An Endpoint maintains the source/destination caching for a peer.

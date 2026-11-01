@@ -9,6 +9,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -29,6 +30,7 @@ import (
 	"golang.zx2c4.com/wireguard/proxy"
 	"golang.zx2c4.com/wireguard/tun"
 	"golang.zx2c4.com/wireguard/tun/netstack"
+	"golang.zx2c4.com/wireguard/warp"
 )
 
 const (
@@ -156,9 +158,69 @@ func warning() {
 	fmt.Fprintln(os.Stderr, "└──────────────────────────────────────────────────────┘")
 }
 
+func runWarpReg(args []string) {
+	var outputFile string
+	var strategy string
+
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "-o", "--output":
+			if i+1 < len(args) {
+				i++
+				outputFile = args[i]
+			}
+		case "-s", "--strategy":
+			if i+1 < len(args) {
+				i++
+				strategy = args[i]
+			}
+		}
+	}
+
+	fmt.Println("🚀 Generating WireGuard X25519 keypair for Cloudflare WARP...")
+	keypair, err := warp.GenerateKeypair()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error generating keypair: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Println("🛰️  Registering client via Cloudflare WARP API (with SNI fragmentation)...")
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	resp, err := warp.Register(ctx, keypair.PublicKey, "ru-RU", "PC")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Registration failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	confText, err := warp.GenerateWireGuardConfig(resp, keypair.PrivateKey, strategy)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error generating configuration: %v\n", err)
+		os.Exit(1)
+	}
+
+	if outputFile != "" {
+		if err := os.WriteFile(outputFile, []byte(confText), 0600); err != nil {
+			fmt.Fprintf(os.Stderr, "Error writing config to %s: %v\n", outputFile, err)
+			os.Exit(1)
+		}
+		fmt.Printf("✅ WireGuard WARP configuration saved to %s\n", outputFile)
+	} else {
+		fmt.Println("\n--- [Generated WARP Configuration] ---")
+		fmt.Println(confText)
+		fmt.Println("--- [End Configuration] ---")
+	}
+}
+
 func main() {
 	if len(os.Args) == 2 && os.Args[1] == "--version" {
 		fmt.Printf("TravonetWG (wireguard-go v%s)\n\nCustom Userspace WireGuard with L3 early-termination evasion for %s-%s.\n", Version, runtime.GOOS, runtime.GOARCH)
+		return
+	}
+
+	if len(os.Args) >= 2 && (os.Args[1] == "warp-reg" || os.Args[1] == "--warp-reg") {
+		runWarpReg(os.Args[2:])
 		return
 	}
 
@@ -367,7 +429,7 @@ func main() {
 	}
 
 	if evasionCfg.Strategy != "" && evasionCfg.Strategy != "default" {
-		if _, err := conn.ParseStrategy(evasionCfg.Strategy); err != nil {
+		if _, err := conn.ParseStrategy(evasionCfg.Strategy, evasionCfg.FakeTTL, evasionCfg.NormalTTL); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: invalid evasion strategy: %v\n", err)
 			os.Exit(ExitSetupFailed)
 		}
@@ -596,7 +658,7 @@ func main() {
 func runSocks5Userspace(socks5Addr string, socksAuth string, parsedConfig *conf.Config, evasionCfg conn.EvasionConfig, debug bool) {
 	// 1. Validate strategy if specified
 	if evasionCfg.Strategy != "" && evasionCfg.Strategy != "default" {
-		if _, err := conn.ParseStrategy(evasionCfg.Strategy); err != nil {
+		if _, err := conn.ParseStrategy(evasionCfg.Strategy, evasionCfg.FakeTTL, evasionCfg.NormalTTL); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: invalid evasion strategy: %v\n", err)
 			os.Exit(ExitSetupFailed)
 			return

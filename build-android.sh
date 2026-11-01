@@ -23,18 +23,43 @@ if ! command -v "$GO_BIN" >/dev/null 2>&1 && [ ! -x "$GO_BIN" ]; then
     exit 1
 fi
 
-# Detect NDK
+# The NDK ships prebuilt clang binaries per host OS.
+HOST_TAG=""
+case "$(uname -s)" in
+    Linux*)  HOST_TAG="linux-x86_64" ;;
+    Darwin*) HOST_TAG="darwin-x86_64" ;;
+    *)
+        echo "Error: unsupported build host '$(uname -s)'. This script supports Linux and macOS." >&2
+        exit 1
+        ;;
+esac
+
+# Detect NDK. When several versions are installed, prefer the newest one:
+# older releases may not support the Go version or the requested ABI.
 if [ -z "${ANDROID_NDK_HOME:-}" ] && [ -z "${ANDROID_NDK_ROOT:-}" ]; then
-    for cand in \
-        "$HOME/Android/Sdk/ndk/"* \
-        "$HOME/Android/Sdk/ndk-bundle" \
-        "/opt/android-sdk/ndk/"* \
-        "/opt/android-ndk/"* \
-        "${ANDROID_HOME:-}/ndk/"*; do
-        if [ -d "$cand/toolchains/llvm/prebuilt/linux-x86_64/bin" ]; then
-            ANDROID_NDK_HOME="$cand"
+    ndk_candidates=()
+    for base in \
+        "$HOME/Android/Sdk/ndk" \
+        "$HOME/Library/Android/sdk/ndk" \
+        "/opt/android-sdk/ndk" \
+        "/opt/android-ndk" \
+        "${ANDROID_HOME:-}/ndk" \
+        "${ANDROID_SDK_ROOT:-}/ndk"; do
+        [ -d "$base" ] || continue
+        for cand in "$base"/*; do
+            if [ -d "$cand/toolchains/llvm/prebuilt/$HOST_TAG/bin" ]; then
+                ndk_candidates+=("$cand")
+            fi
+        done
+    done
+    for bundle in "$HOME/Android/Sdk/ndk-bundle" "/opt/android-ndk"; do
+        if [ -d "$bundle/toolchains/llvm/prebuilt/$HOST_TAG/bin" ]; then
+            ndk_candidates+=("$bundle")
         fi
     done
+    if [ ${#ndk_candidates[@]} -gt 0 ]; then
+        ANDROID_NDK_HOME="$(printf '%s\n' "${ndk_candidates[@]}" | sort -V | tail -n 1)"
+    fi
 fi
 
 ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-}}"
@@ -43,7 +68,7 @@ if [ -z "$ANDROID_NDK_HOME" ] || [ ! -d "$ANDROID_NDK_HOME" ]; then
     exit 1
 fi
 
-TOOLCHAIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+TOOLCHAIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/$HOST_TAG/bin"
 if [ ! -d "$TOOLCHAIN" ]; then
     echo "Error: Toolchain directory '$TOOLCHAIN' does not exist." >&2
     exit 1

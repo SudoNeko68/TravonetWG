@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"sync"
 	"syscall"
+	"time"
 
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
@@ -89,12 +90,45 @@ var (
 
 func (*StdNetBind) ParseEndpoint(s string) (Endpoint, error) {
 	e, err := netip.ParseAddrPort(s)
-	if err != nil {
+	if err == nil {
+		return &StdNetEndpoint{
+			AddrPort: e,
+		}, nil
+	}
+
+	host, portStr, splitErr := net.SplitHostPort(s)
+	if splitErr != nil {
 		return nil, err
 	}
-	return &StdNetEndpoint{
-		AddrPort: e,
-	}, nil
+	port, convErr := strconv.Atoi(portStr)
+	if convErr != nil || port <= 0 || port > 65535 {
+		return nil, err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	// Prioritize IPv4
+	if addrs, lookupErr := net.DefaultResolver.LookupNetIP(ctx, "ip4", host); lookupErr == nil {
+		for _, addr := range addrs {
+			if addr.Is4() {
+				return &StdNetEndpoint{
+					AddrPort: netip.AddrPortFrom(addr, uint16(port)),
+				}, nil
+			}
+		}
+	}
+
+	// Fallback to IPv6 if no IPv4 address exists
+	if addrs, lookupErr := net.DefaultResolver.LookupNetIP(ctx, "ip", host); lookupErr == nil {
+		for _, addr := range addrs {
+			return &StdNetEndpoint{
+				AddrPort: netip.AddrPortFrom(addr, uint16(port)),
+			}, nil
+		}
+	}
+
+	return nil, err
 }
 
 func (e *StdNetEndpoint) ClearSrc() {
