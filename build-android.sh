@@ -133,9 +133,6 @@ for entry in "${ABIS[@]}"; do
     # Remove temporary generated C header in output if not needed
     rm -f "$ABI_OUT_DIR/libtravonet-wg.h"
 
-    # Also create libwg-go.so copy for 100% drop-in compatibility with WireGuard Android
-    cp -f "$TARGET_SO" "$WG_GO_SO"
-
     SO_SIZE=$(ls -lh "$TARGET_SO" | awk '{print $5}')
     echo ">>> Successfully built $ABI -> $TARGET_SO ($SO_SIZE)"
 done

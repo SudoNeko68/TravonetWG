@@ -262,13 +262,9 @@ func ParseConfig(r io.Reader) (*Config, error) {
 			case "contentpaddingaddition", "content_padding_addition":
 				cfg.ContentPaddingAddition = val
 			case "randomtrailers", "random_trailers":
-				if b, err := strconv.ParseBool(val); err == nil {
-					cfg.RandomTrailers = b
-				}
+				cfg.RandomTrailers = parseBoolValue(val)
 			case "disablecookies", "disable_cookies":
-				if b, err := strconv.ParseBool(val); err == nil {
-					cfg.DisableCookies = b
-				}
+				cfg.DisableCookies = parseBoolValue(val)
 			case "rekeyaftertime", "rekey_after_time":
 				cfg.RekeyAfterTime = val
 			case "rekeytimeout", "rekey_timeout":

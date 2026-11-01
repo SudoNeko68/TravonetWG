@@ -6,6 +6,7 @@
 package conf
 
 import (
+	"bufio"
 	"bytes"
 	"compress/gzip"
 	"compress/zlib"
@@ -16,6 +17,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/url"
 	"strconv"
 	"strings"
 )
@@ -39,6 +41,7 @@ type AmneziaRoot struct {
 
 // ParseVPNURL decodes an Amnezia "vpn://" URL, extracts the AmneziaWG/WireGuard configuration,
 // and returns the standard WireGuard/AmneziaWG INI config text along with the suggested profile name.
+// Supports both official Amnezia JSON containers and 3X-UI raw Base64 INI exports.
 func ParseVPNURL(vpnURL string) (configText string, profileName string, err error) {
 	trimmed := strings.TrimSpace(vpnURL)
 	if !strings.HasPrefix(strings.ToLower(trimmed), "vpn://") {
@@ -46,6 +49,8 @@ func ParseVPNURL(vpnURL string) (configText string, profileName string, err erro
 	}
 
 	payload := strings.TrimSpace(trimmed[6:])
+	// Trim trailing punctuation (e.g. dots, commas, query params, slashes, whitespace)
+	payload = strings.TrimRight(payload, ".\r\n\t ,;/?#")
 	if payload == "" {
 		return "", "", errors.New("vpn:// payload is empty")
 	}
@@ -55,16 +60,111 @@ func ParseVPNURL(vpnURL string) (configText string, profileName string, err erro
 		return "", "", fmt.Errorf("base64 decode: %w", err)
 	}
 
-	decompressed, err := decompressAmneziaPayload(rawBytes)
-	if err != nil {
-		return "", "", fmt.Errorf("decompress amnezia payload: %w", err)
+	// 1. Direct check: is rawBytes an uncompressed WireGuard/AmneziaWG INI config?
+	rawStr := strings.TrimSpace(string(rawBytes))
+	if isWireGuardINI(rawStr) {
+		name := extractProfileNameFromINI(rawStr)
+		return rawStr, name, nil
 	}
 
-	return parseAmneziaJSON(decompressed)
+	// 2. Try decompression (Qt qCompress, raw zlib, raw gzip)
+	decompressed, err := decompressAmneziaPayload(rawBytes)
+	if err == nil {
+		decompStr := strings.TrimSpace(string(decompressed))
+		if isWireGuardINI(decompStr) {
+			name := extractProfileNameFromINI(decompStr)
+			return decompStr, name, nil
+		}
+		// If decompressed is JSON, parse as Amnezia JSON
+		if strings.HasPrefix(decompStr, "{") || strings.HasPrefix(decompStr, "[") {
+			return parseAmneziaJSON(decompressed)
+		}
+	}
+
+	// If decompress failed or didn't match, try parsing rawBytes as JSON
+	if strings.HasPrefix(rawStr, "{") || strings.HasPrefix(rawStr, "[") {
+		return parseAmneziaJSON(rawBytes)
+	}
+
+	return "", "", errors.New("unrecognized vpn:// payload format")
+}
+
+func isWireGuardINI(s string) bool {
+	trimmed := strings.TrimSpace(s)
+	if strings.HasPrefix(trimmed, "{") {
+		return false
+	}
+	return strings.Contains(trimmed, "[Interface]") && (strings.Contains(trimmed, "PrivateKey") || strings.Contains(trimmed, "[Peer]"))
+}
+
+func extractProfileNameFromINI(iniText string) string {
+	var explicitName string
+	var commentName string
+	var endpointHost string
+
+	scanner := bufio.NewScanner(strings.NewReader(iniText))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
+			comment := strings.TrimSpace(strings.TrimLeft(line, "#; "))
+			lower := strings.ToLower(comment)
+			if strings.HasPrefix(lower, "name:") || strings.HasPrefix(lower, "name=") {
+				explicitName = strings.TrimSpace(comment[5:])
+			} else if strings.HasPrefix(lower, "profile:") || strings.HasPrefix(lower, "profile=") {
+				explicitName = strings.TrimSpace(comment[8:])
+			} else if commentName == "" && comment != "" && !strings.HasPrefix(lower, "spdx-") {
+				commentName = comment
+			}
+			continue
+		}
+
+		if eq := strings.Index(line, "="); eq >= 0 {
+			key := strings.ToLower(strings.TrimSpace(line[:eq]))
+			val := strings.TrimSpace(line[eq+1:])
+			if key == "endpoint" && endpointHost == "" {
+				host, _, err := net.SplitHostPort(val)
+				if err == nil && host != "" {
+					endpointHost = host
+				} else if val != "" {
+					endpointHost = val
+				}
+			}
+		}
+	}
+
+	if explicitName != "" {
+		return explicitName
+	}
+	if commentName != "" && endpointHost != "" {
+		if strings.EqualFold(commentName, "AmneziaWG") || strings.EqualFold(commentName, "WireGuard") {
+			return fmt.Sprintf("%s (%s)", commentName, endpointHost)
+		}
+		return commentName
+	}
+	if commentName != "" {
+		return commentName
+	}
+	if endpointHost != "" {
+		return endpointHost
+	}
+	return "AmneziaWG"
 }
 
 func decodeBase64Payload(payload string) ([]byte, error) {
-	// Amnezia uses URL-safe Base64 without trailing padding, but some exporters use standard base64.
+	// Strip any whitespace
+	payload = strings.ReplaceAll(payload, "\r", "")
+	payload = strings.ReplaceAll(payload, "\n", "")
+	payload = strings.ReplaceAll(payload, " ", "")
+	payload = strings.ReplaceAll(payload, "\t", "")
+
+	// Handle URL percent-encoding if present (%2B, %2F, %3D etc.)
+	if strings.Contains(payload, "%") {
+		if unescaped, err := url.QueryUnescape(payload); err == nil {
+			payload = unescaped
+		}
+	}
+
+	// Try standard and URL-safe base64 decoders
 	encodings := []*base64.Encoding{
 		base64.RawURLEncoding,
 		base64.URLEncoding,
@@ -77,6 +177,17 @@ func decodeBase64Payload(payload string) ([]byte, error) {
 			return data, nil
 		}
 	}
+
+	// Try with added padding if missing
+	if rem := len(payload) % 4; rem != 0 {
+		padded := payload + strings.Repeat("=", 4-rem)
+		for _, enc := range encodings {
+			if data, err := enc.DecodeString(padded); err == nil && len(data) > 0 {
+				return data, nil
+			}
+		}
+	}
+
 	return nil, errors.New("invalid base64 encoding")
 }
 

@@ -110,3 +110,58 @@ func TestParseVPNURL_QtQCompress(t *testing.T) {
 		t.Errorf("parsed config mismatch: %+v", cfg)
 	}
 }
+
+func TestParseVPNURL_RawINI3XUI(t *testing.T) {
+	// Real 3X-UI generated vpn:// link with trailing dot
+	testURL := "vpn://W0ludGVyZmFjZV0KUHJpdmF0ZUtleSA9IHdKREQ2RXF3UmxWd09DWVNUc1RkU21ycVVRNC84NlZkYURqWnA4QmNmazQ9CkFkZHJlc3MgPSAxMC44LjEuMjYvMzIKRE5TID0gOC44LjguOCwgOC44LjQuNApNVFUgPSAxMjAwCkpjID0gNApKbWluID0gNTIKSm1heCA9IDEwNQpTMSA9IDE1MApTMiA9IDc0ClMzID0gNDAKUzQgPSAyMwpIMSA9IDUyMTMxNDY5NwpIMiA9IDk0NzYxOTA3MApIMyA9IDE0NTE2MDExNDIKSDQgPSAyMDg3NzI5MTYyCkkxID0gPHIgMTc1PgpIZWFkZXJQcm90ZWN0aW9uS2V5ID0gc0lKVGN0VHFneklEa2k4bGp5YWtaeTZhQWNWM0N0TW9nb2xZbjc5NVhtVT0KQ29udGVudFBhZGRpbmdBZGRpdGlvbiA9IDgtMzMKUmVrZXlBZnRlclRpbWUgPSAxMDYtMTM4ClJla2V5VGltZW91dCA9IDQtNwpSZWplY3RBZnRlclRpbWUgPSAxODAtMjY0CktlZXBhbGl2ZVRpbWVvdXQgPSA5LTEyCk1heEhhbmRzaGFrZUF0dGVtcHRzID0gMTgtMjUKUmFuZG9tVHJhaWxlcnMgPSBvbgpEaXNhYmxlQ29va2llcyA9IG9uCgojIEFtbmV6aWFXRwpbUGVlcl0KUHVibGljS2V5ID0gbC91Ti9hQ2pIQ25Ndmw4a3NtS1F2bU82aEpQY0dRZXpkQnFPcVVZcXAxTT0KQWxsb3dlZElQcyA9IDAuMC4wLjAvMCwgOjovMApFbmRwb2ludCA9IHRyYXZvbmV0LnJ1OjI5ODM1ClBlcnNpc3RlbnRLZWVwYWxpdmUgPSAyNQ."
+
+	confText, name, err := ParseVPNURL(testURL)
+	if err != nil {
+		t.Fatalf("ParseVPNURL failed on raw 3X-UI URL: %v", err)
+	}
+
+	if !strings.Contains(confText, "PrivateKey = wJDD6EqwRlVwOCYSTsTdSmrqUQ4/86VdaDjZp8Bcfk4=") {
+		t.Errorf("missing PrivateKey in config: %s", confText)
+	}
+	if !strings.Contains(confText, "Endpoint = travonet.ru:29835") {
+		t.Errorf("missing Endpoint in config: %s", confText)
+	}
+	if name != "AmneziaWG (travonet.ru)" {
+		t.Errorf("expected name 'AmneziaWG (travonet.ru)', got %q", name)
+	}
+
+	cfg, err := ParseConfigString(testURL)
+	if err != nil {
+		t.Fatalf("ParseConfigString failed: %v", err)
+	}
+
+	if cfg.Jc != 4 || cfg.Jmin != 52 || cfg.Jmax != 105 {
+		t.Errorf("AWG J params mismatch: %+v", cfg)
+	}
+	if cfg.S1 != 150 || cfg.S2 != 74 || cfg.S3 != 40 || cfg.S4 != 23 {
+		t.Errorf("AWG S params mismatch: %+v", cfg)
+	}
+	if cfg.H1 != "521314697" || cfg.H4 != "2087729162" {
+		t.Errorf("AWG H params mismatch: %+v", cfg)
+	}
+	if cfg.I1 != "<r 175>" {
+		t.Errorf("AWG I1 mismatch: %q", cfg.I1)
+	}
+	if !cfg.RandomTrailers || !cfg.DisableCookies {
+		t.Errorf("RandomTrailers (%v) or DisableCookies (%v) not parsed as true", cfg.RandomTrailers, cfg.DisableCookies)
+	}
+	if cfg.HeaderProtectionKey != "sIJTctTqgzIDki8ljyakZy6aAcV3CtMogolYn795XmU=" {
+		t.Errorf("HeaderProtectionKey mismatch: %q", cfg.HeaderProtectionKey)
+	}
+	if cfg.RekeyAfterTime != "106-138" {
+		t.Errorf("RekeyAfterTime mismatch: %q", cfg.RekeyAfterTime)
+	}
+
+	uapi, err := cfg.ToUAPI()
+	if err != nil {
+		t.Fatalf("ToUAPI failed: %v", err)
+	}
+	if !strings.Contains(uapi, "jc=4") || !strings.Contains(uapi, "random_trailers=true") || !strings.Contains(uapi, "disable_cookies=true") {
+		t.Errorf("UAPI missing AWG parameters: %s", uapi)
+	}
+}
