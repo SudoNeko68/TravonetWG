@@ -409,10 +409,39 @@ func jsonConfigToWireGuardINI(cfg, parent map[string]any, hostName, dns1, dns2 s
 	}
 
 	// AmneziaWG obfuscation parameters
-	awgKeys := []string{"Jc", "Jmin", "Jmax", "S1", "S2", "S3", "S4", "H1", "H2", "H3", "H4", "I1", "I2", "I3", "I4", "I5"}
-	for _, k := range awgKeys {
-		if v := getStringAny(cfg, k, strings.ToLower(k)); v != "" {
-			sb.WriteString(fmt.Sprintf("%s = %s\n", k, v))
+	awgKeys := []struct {
+		iniKey  string
+		aliases []string
+	}{
+		{"Jc", []string{"Jc", "jc"}},
+		{"Jmin", []string{"Jmin", "jmin"}},
+		{"Jmax", []string{"Jmax", "jmax"}},
+		{"S1", []string{"S1", "s1"}},
+		{"S2", []string{"S2", "s2"}},
+		{"S3", []string{"S3", "s3"}},
+		{"S4", []string{"S4", "s4"}},
+		{"H1", []string{"H1", "h1"}},
+		{"H2", []string{"H2", "h2"}},
+		{"H3", []string{"H3", "h3"}},
+		{"H4", []string{"H4", "h4"}},
+		{"I1", []string{"I1", "i1"}},
+		{"I2", []string{"I2", "i2"}},
+		{"I3", []string{"I3", "i3"}},
+		{"I4", []string{"I4", "i4"}},
+		{"I5", []string{"I5", "i5"}},
+		{"HeaderProtectionKey", []string{"HeaderProtectionKey", "header_protection_key", "headerprotectionkey"}},
+		{"ContentPaddingAddition", []string{"ContentPaddingAddition", "content_padding_addition", "contentpaddingaddition"}},
+		{"RandomTrailers", []string{"RandomTrailers", "random_trailers", "randomtrailers"}},
+		{"DisableCookies", []string{"DisableCookies", "disable_cookies", "disablecookies"}},
+		{"RekeyAfterTime", []string{"RekeyAfterTime", "rekey_after_time", "rekeyaftertime"}},
+		{"RekeyTimeout", []string{"RekeyTimeout", "rekey_timeout", "rekeytimeout"}},
+		{"RejectAfterTime", []string{"RejectAfterTime", "reject_after_time", "rejectaftertime"}},
+		{"KeepaliveTimeout", []string{"KeepaliveTimeout", "keepalive_timeout", "keepalivetimeout"}},
+		{"MaxHandshakeAttempts", []string{"MaxHandshakeAttempts", "max_handshake_attempts", "maxhandshakeattempts"}},
+	}
+	for _, item := range awgKeys {
+		if v := getStringAny(cfg, item.aliases...); v != "" {
+			sb.WriteString(fmt.Sprintf("%s = %s\n", item.iniKey, v))
 		}
 	}
 
@@ -483,6 +512,11 @@ func getStringAny(m map[string]any, keys ...string) string {
 				return strconv.Itoa(v)
 			case int64:
 				return strconv.FormatInt(v, 10)
+			case bool:
+				if v {
+					return "true"
+				}
+				return "false"
 			}
 		}
 	}
