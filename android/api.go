@@ -411,7 +411,7 @@ func wgGetConfig(tunnelHandle int32) *C.char {
 
 //export wgVersion
 func wgVersion() *C.char {
-	return C.CString("TravonetWG-1.11 (wireguard-go)")
+	return C.CString("TravonetWG-1.3 (wireguard-go)")
 }
 
 //export wgStartSocks5
