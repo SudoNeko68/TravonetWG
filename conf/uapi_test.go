@@ -178,3 +178,32 @@ func TestFilterUAPINoPeerNoKeepalive(t *testing.T) {
 		t.Errorf("device-level keys were dropped:\n%s", clean)
 	}
 }
+
+func TestFilterUAPIKeepaliveRange(t *testing.T) {
+	const settings = `public_key=bbbb
+endpoint=1.2.3.4:2408
+persistent_keepalive_interval=20-30
+public_key=cccc
+endpoint=8.34.70.70:500
+persistent_keepalive_interval=15-25
+`
+	clean, _ := FilterUAPI(settings)
+	if !strings.Contains(clean, "persistent_keepalive_interval=20-30") {
+		t.Fatalf("range keepalive was lost or rewritten:\n%s", clean)
+	}
+	// port 500 endpoint must clamp range to 5
+	if !strings.Contains(clean, "persistent_keepalive_interval=5") {
+		t.Fatalf("port 500 endpoint range keepalive was not clamped to 5:\n%s", clean)
+	}
+}
+
+func TestFilterUAPISocksStripping(t *testing.T) {
+	const settings = `socks5=127.0.0.1:1080
+socks_auth=user:pass
+public_key=bbbb
+`
+	clean, _ := FilterUAPI(settings)
+	if strings.Contains(clean, "socks5=") || strings.Contains(clean, "socks_auth=") {
+		t.Fatalf("socks keys leaked into UAPI:\n%s", clean)
+	}
+}

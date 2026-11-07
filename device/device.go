@@ -95,44 +95,45 @@ type Device struct {
 	// ordinary WireGuard peers.
 	reserved atomic.Uint32
 
-	// AmneziaWG wire-format obfuscation (see amnezia.go).
-	amnezia struct {
-		junk struct {
-			count atomic.Uint32
-			min   atomic.Uint32
-			max   atomic.Uint32
-		}
-		paddings struct {
-			init      atomic.Uint32
-			response  atomic.Uint32
-			cookie    atomic.Uint32
-			transport atomic.Uint32
-		}
-		headers struct {
-			init      AtomicUintRange
-			response  AtomicUintRange
-			cookie    AtomicUintRange
-			transport AtomicUintRange
-		}
-		signatures [5]atomic.Pointer[signaturePacket]
-
-		headerProtection struct {
-			sync.RWMutex
-			key HeaderCipherKey
-		}
-
-		contentPaddingAddition AtomicUintRange
-		randomTrailers         atomic.Bool
-		disableCookies         atomic.Bool
-
-		timings struct {
-			rekeyAfterTimeSec   AtomicUintRange
-			rekeyTimeoutSec     AtomicUintRange
-			rejectAfterTimeSec  AtomicUintRange
-			keepaliveTimeoutSec AtomicUintRange
-			maxHandshakeAttemps AtomicUintRange
-		}
+	junk struct {
+		min   atomic.Uint32
+		max   atomic.Uint32
+		count atomic.Uint32
 	}
+
+	headers struct {
+		init      AtomicUintRange
+		cookie    AtomicUintRange
+		response  AtomicUintRange
+		transport AtomicUintRange
+	}
+
+	paddings struct {
+		init      atomic.Uint32
+		response  atomic.Uint32
+		cookie    atomic.Uint32
+		transport atomic.Uint32
+	}
+
+	ipackets [5]*obfChain
+
+	headerProtection struct {
+		sync.RWMutex
+		key HeaderCipherKey
+	}
+
+	contentPaddingAddition AtomicUintRange
+
+	timings struct {
+		rekeyAfterTimeSec   AtomicUintRange
+		rekeyTimeoutSec     AtomicUintRange
+		rejectAfterTimeSec  AtomicUintRange
+		keepaliveTimeoutSec AtomicUintRange
+		maxHandshakeAttemps AtomicUintRange
+	}
+
+	randomTrailers atomic.Bool
+	disableCookies atomic.Bool
 }
 
 // deviceState represents the state of a Device.
@@ -341,9 +342,18 @@ func NewDevice(tunDevice tun.Device, bind conn.Bind, logger *Logger) *Device {
 	device.peers.keyMap = make(map[NoisePublicKey]*Peer)
 	device.rate.limiter.Init()
 	device.indexTable.Init()
-	device.initAmnezia()
 
 	device.PopulatePools()
+
+	var rang UintRange
+	rang.FromUint32(MessageInitiationType, MessageInitiationType)
+	device.headers.init.Store(rang)
+	rang.FromUint32(MessageResponseType, MessageResponseType)
+	device.headers.response.Store(rang)
+	rang.FromUint32(MessageCookieReplyType, MessageCookieReplyType)
+	device.headers.cookie.Store(rang)
+	rang.FromUint32(MessageTransportType, MessageTransportType)
+	device.headers.transport.Store(rang)
 
 	// create queues
 

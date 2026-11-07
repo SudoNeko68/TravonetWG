@@ -20,11 +20,12 @@ import (
 )
 
 type PeerConfig struct {
-	PublicKey           string
-	PresharedKey        string
-	Endpoint            string
-	AllowedIPs          []string
-	PersistentKeepalive int
+	PublicKey                string
+	PresharedKey             string
+	Endpoint                 string
+	AllowedIPs               []string
+	PersistentKeepalive      int
+	PersistentKeepaliveRange string
 }
 
 type Config struct {
@@ -87,10 +88,11 @@ type Config struct {
 	Peers []PeerConfig
 
 	// Backward-compatibility shortcuts for primary peer
-	PublicKey           string
-	Endpoint            string
-	AllowedIPs          []string
-	PersistentKeepalive int
+	PublicKey                string
+	Endpoint                 string
+	AllowedIPs               []string
+	PersistentKeepalive      int
+	PersistentKeepaliveRange string
 }
 
 // ParseConfigFile parses a WireGuard .conf file
@@ -278,6 +280,13 @@ func ParseConfig(r io.Reader) (*Config, error) {
 			case "persistentkeepalive", "persistent_keepalive", "persistent-keepalive":
 				if pka, err := strconv.Atoi(val); err == nil && pka > 0 {
 					cfg.PersistentKeepalive = pka
+				} else if strings.Contains(val, "-") {
+					cfg.PersistentKeepaliveRange = val
+					if dashIdx := strings.Index(val, "-"); dashIdx > 0 {
+						if pka, err := strconv.Atoi(strings.TrimSpace(val[:dashIdx])); err == nil {
+							cfg.PersistentKeepalive = pka
+						}
+					}
 				}
 			case "socks5", "socks", "socks_proxy", "socks5_proxy":
 				cfg.Socks5 = val
@@ -311,6 +320,13 @@ func ParseConfig(r io.Reader) (*Config, error) {
 			case "persistentkeepalive", "persistent_keepalive", "persistent-keepalive", "persistentkeepaliveinterval", "persistent_keepalive_interval":
 				if pka, err := strconv.Atoi(val); err == nil && pka > 0 {
 					curPeer.PersistentKeepalive = pka
+				} else if strings.Contains(val, "-") {
+					curPeer.PersistentKeepaliveRange = val
+					if dashIdx := strings.Index(val, "-"); dashIdx > 0 {
+						if pka, err := strconv.Atoi(strings.TrimSpace(val[:dashIdx])); err == nil {
+							curPeer.PersistentKeepalive = pka
+						}
+					}
 				}
 			}
 		}
@@ -326,15 +342,19 @@ func ParseConfig(r io.Reader) (*Config, error) {
 	}
 
 	for i := range peers {
-		if peers[i].PersistentKeepalive <= 0 {
-			if cfg.PersistentKeepalive > 0 {
+		if peers[i].PersistentKeepalive <= 0 && peers[i].PersistentKeepaliveRange == "" {
+			if cfg.PersistentKeepaliveRange != "" {
+				peers[i].PersistentKeepaliveRange = cfg.PersistentKeepaliveRange
+				peers[i].PersistentKeepalive = cfg.PersistentKeepalive
+			} else if cfg.PersistentKeepalive > 0 {
 				peers[i].PersistentKeepalive = cfg.PersistentKeepalive
 			} else {
 				peers[i].PersistentKeepalive = DefaultKeepalive
 			}
 		}
-		if IsPort500Endpoint(peers[i].Endpoint) && peers[i].PersistentKeepalive > LowPortKeepaliveLimit {
+		if IsPort500Endpoint(peers[i].Endpoint) && (peers[i].PersistentKeepalive > LowPortKeepaliveLimit || peers[i].PersistentKeepaliveRange != "") {
 			peers[i].PersistentKeepalive = LowPortKeepalive
+			peers[i].PersistentKeepaliveRange = ""
 		}
 	}
 	cfg.Peers = peers
@@ -343,12 +363,14 @@ func ParseConfig(r io.Reader) (*Config, error) {
 		cfg.Endpoint = ResolveEndpointHostPort(peers[0].Endpoint)
 		cfg.AllowedIPs = peers[0].AllowedIPs
 		cfg.PersistentKeepalive = peers[0].PersistentKeepalive
+		cfg.PersistentKeepaliveRange = peers[0].PersistentKeepaliveRange
 	} else {
-		if cfg.PersistentKeepalive <= 0 {
+		if cfg.PersistentKeepalive <= 0 && cfg.PersistentKeepaliveRange == "" {
 			cfg.PersistentKeepalive = DefaultKeepalive
 		}
-		if IsPort500Endpoint(cfg.Endpoint) && cfg.PersistentKeepalive > LowPortKeepaliveLimit {
+		if IsPort500Endpoint(cfg.Endpoint) && (cfg.PersistentKeepalive > LowPortKeepaliveLimit || cfg.PersistentKeepaliveRange != "") {
 			cfg.PersistentKeepalive = LowPortKeepalive
+			cfg.PersistentKeepaliveRange = ""
 		}
 	}
 
@@ -550,10 +572,11 @@ func (c *Config) ToUAPI() (string, error) {
 	peers := c.Peers
 	if len(peers) == 0 && c.PublicKey != "" {
 		peers = []PeerConfig{{
-			PublicKey:           c.PublicKey,
-			Endpoint:            c.Endpoint,
-			AllowedIPs:          c.AllowedIPs,
-			PersistentKeepalive: c.PersistentKeepalive,
+			PublicKey:                c.PublicKey,
+			Endpoint:                 c.Endpoint,
+			AllowedIPs:               c.AllowedIPs,
+			PersistentKeepalive:      c.PersistentKeepalive,
+			PersistentKeepaliveRange: c.PersistentKeepaliveRange,
 		}}
 	}
 
@@ -588,7 +611,9 @@ func (c *Config) ToUAPI() (string, error) {
 				}
 			}
 
-			if peer.PersistentKeepalive > 0 {
+			if peer.PersistentKeepaliveRange != "" {
+				sb.WriteString(fmt.Sprintf("persistent_keepalive_interval=%s\n", peer.PersistentKeepaliveRange))
+			} else if peer.PersistentKeepalive > 0 {
 				sb.WriteString(fmt.Sprintf("persistent_keepalive_interval=%d\n", peer.PersistentKeepalive))
 			}
 		}

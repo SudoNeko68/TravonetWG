@@ -77,8 +77,10 @@ func (peer *Peer) timersActive() bool {
 }
 
 func expiredRetransmitHandshake(peer *Peer) {
-	if peer.timers.handshakeAttempts.Load() > peer.device.maxHandshakeAttempts() {
-		peer.device.log.Verbosef("%s - Handshake did not complete after %d attempts, giving up", peer, peer.device.maxHandshakeAttempts()+2)
+	maxAttempts := peer.timers.maxHandshakeAttempts.Load()
+
+	if peer.timers.handshakeAttempts.Load() > maxAttempts {
+		peer.device.log.Verbosef("%s - Handshake did not complete after %d attempts, giving up", peer, maxAttempts+2)
 
 		if peer.timersActive() {
 			peer.timers.sendKeepalive.Del()
@@ -93,11 +95,12 @@ func expiredRetransmitHandshake(peer *Peer) {
 		 * of a partial exchange.
 		 */
 		if peer.timersActive() && !peer.timers.zeroKeyMaterial.IsPending() {
-			peer.timers.zeroKeyMaterial.Mod(RejectAfterTime * 3)
+			peer.timers.zeroKeyMaterial.Mod(peer.device.keychainExpireTime() * 3)
 		}
 	} else {
 		attempt := peer.timers.handshakeAttempts.Add(1)
-		peer.device.log.Verbosef("%s - Handshake did not complete after %d seconds, retrying (try %d)", peer, int(peer.retransmitHandshakeTimeout().Seconds()), attempt+1)
+		timeout := peer.retransmitHandshakeTimeout()
+		peer.device.log.Verbosef("%s - Handshake did not complete after %d seconds, retrying (try %d)", peer, int(timeout.Seconds()), attempt+1)
 
 		/* We clear the endpoint address src address, in case this is the cause of trouble. */
 		peer.markEndpointSrcForClearing()
@@ -135,17 +138,17 @@ func expiredNewHandshake(peer *Peer) {
 }
 
 func expiredZeroKeyMaterial(peer *Peer) {
-	peer.device.log.Verbosef("%s - Removing all keys, since we haven't received a new one in %d seconds", peer, int((RejectAfterTime * 3).Seconds()))
+	peer.device.log.Verbosef("%s - Removing all keys, since we haven't received a new one in %d seconds", peer, int((peer.device.keychainExpireTime() * 3).Seconds()))
 	peer.ZeroAndFlushAll()
 }
 
 func expiredPersistentKeepalive(peer *Peer) {
 	keepalive := peer.persistentKeepaliveInterval.Load()
-	if keepalive > 0 {
-		peer.device.log.Verbosef("%v - Persistent keepalive triggered (%ds)", peer, keepalive)
+	if !keepalive.IsZero() {
+		peer.device.log.Verbosef("%v - Persistent keepalive triggered (%ss)", peer, keepalive.ToString())
 		peer.SendKeepalive()
 		if peer.timersActive() {
-			peer.timers.persistentKeepalive.Mod(time.Duration(keepalive) * time.Second)
+			peer.timers.persistentKeepalive.Mod(time.Duration(keepalive.PickOne()) * time.Second)
 		}
 	}
 }
@@ -195,6 +198,7 @@ func (peer *Peer) timersHandshakeComplete() {
 		peer.timers.retransmitHandshake.Del()
 	}
 	peer.timers.handshakeAttempts.Store(0)
+	peer.timers.maxHandshakeAttempts.Store(peer.device.maxHandshakeAttemps())
 	peer.timers.sentLastMinuteHandshake.Store(false)
 	peer.lastHandshakeNano.Store(time.Now().UnixNano())
 }
@@ -202,15 +206,15 @@ func (peer *Peer) timersHandshakeComplete() {
 /* Should be called after an ephemeral key is created, which is before sending a handshake response or after receiving a handshake response. */
 func (peer *Peer) timersSessionDerived() {
 	if peer.timersActive() {
-		peer.timers.zeroKeyMaterial.Mod(RejectAfterTime * 3)
+		peer.timers.zeroKeyMaterial.Mod(peer.device.keychainExpireTime() * 3)
 	}
 }
 
 /* Should be called before a packet with authentication -- keepalive, data, or handshake -- is sent, or after one is received. */
 func (peer *Peer) timersAnyAuthenticatedPacketTraversal() {
 	keepalive := peer.persistentKeepaliveInterval.Load()
-	if keepalive > 0 && peer.timersActive() {
-		peer.timers.persistentKeepalive.Mod(time.Duration(keepalive) * time.Second)
+	if !keepalive.IsZero() && peer.timersActive() {
+		peer.timers.persistentKeepalive.Mod(time.Duration(keepalive.PickOne()) * time.Second)
 	}
 }
 
@@ -224,10 +228,11 @@ func (peer *Peer) timersInit() {
 
 func (peer *Peer) timersStart() {
 	peer.timers.handshakeAttempts.Store(0)
+	peer.timers.maxHandshakeAttempts.Store(peer.device.maxHandshakeAttemps())
 	peer.timers.sentLastMinuteHandshake.Store(false)
 	peer.timers.needAnotherKeepalive.Store(false)
-	if keepalive := peer.persistentKeepaliveInterval.Load(); keepalive > 0 {
-		peer.timers.persistentKeepalive.Mod(time.Duration(keepalive) * time.Second)
+	if keepalive := peer.persistentKeepaliveInterval.Load(); !keepalive.IsZero() {
+		peer.timers.persistentKeepalive.Mod(time.Duration(keepalive.PickOne()) * time.Second)
 	}
 }
 
@@ -237,4 +242,96 @@ func (peer *Peer) timersStop() {
 	peer.timers.newHandshake.DelSync()
 	peer.timers.zeroKeyMaterial.DelSync()
 	peer.timers.persistentKeepalive.DelSync()
+}
+
+func (peer *Peer) retransmitHandshakeTimeout() time.Duration {
+	timeout := RekeyTimeout
+
+	if t := peer.device.timings.rekeyTimeoutSec.Load(); !t.IsZero() {
+		timeout = time.Duration(t.PickOne()) * time.Second
+	}
+
+	return timeout
+}
+
+func (peer *Peer) sendKeepaliveTimeout() time.Duration {
+	timeout := KeepaliveTimeout
+
+	if t := peer.device.timings.keepaliveTimeoutSec.Load(); !t.IsZero() {
+		timeout = time.Duration(t.PickOne()) * time.Second
+	}
+
+	return timeout
+}
+
+func (peer *Peer) newHandshakeTimeout() time.Duration {
+	keepaliveTimeout := KeepaliveTimeout
+	rekeyTimeout := RekeyTimeout
+
+	if t := peer.device.timings.keepaliveTimeoutSec.Load(); !t.IsZero() {
+		keepaliveTimeout = time.Duration(t.Hi()) * time.Second
+	}
+	if t := peer.device.timings.rekeyTimeoutSec.Load(); !t.IsZero() {
+		rekeyTimeout = time.Duration(t.PickOne()) * time.Second
+	}
+
+	return keepaliveTimeout + rekeyTimeout
+}
+
+func (device *Device) keyRefreshTimeoutSending() time.Duration {
+	rekeyAfterTime := RekeyAfterTime
+
+	if t := device.timings.rekeyAfterTimeSec.Load(); !t.IsZero() {
+		rekeyAfterTime = time.Duration(t.PickOne()) * time.Second
+	}
+
+	return rekeyAfterTime
+}
+
+func (device *Device) keyRefreshTimeoutReceiving() time.Duration {
+	rejectAfterTime := RejectAfterTime
+	keepaliveTimeout := KeepaliveTimeout
+	rekeyTimeout := RekeyTimeout
+
+	if t := device.timings.rejectAfterTimeSec.Load(); !t.IsZero() {
+		rejectAfterTime = time.Duration(t.PickOne()) * time.Second
+	}
+	if t := device.timings.keepaliveTimeoutSec.Load(); !t.IsZero() {
+		keepaliveTimeout = time.Duration(t.Lo()) * time.Second
+	}
+	if t := device.timings.rekeyTimeoutSec.Load(); !t.IsZero() {
+		rekeyTimeout = time.Duration(t.Lo()) * time.Second
+	}
+
+	return max(0, rejectAfterTime-keepaliveTimeout-rekeyTimeout)
+}
+
+func (device *Device) keychainExpireTime() time.Duration {
+	rejectAfterTime := RejectAfterTime
+
+	if t := device.timings.rejectAfterTimeSec.Load(); !t.IsZero() {
+		rejectAfterTime = time.Duration(t.Hi()) * time.Second
+	}
+
+	return rejectAfterTime
+}
+
+func (device *Device) rekeyMinTimeout() time.Duration {
+	rekeyTimeout := RekeyTimeout
+
+	if t := device.timings.rekeyTimeoutSec.Load(); !t.IsZero() {
+		rekeyTimeout = time.Duration(t.Lo()) * time.Second
+	}
+
+	return rekeyTimeout
+}
+
+func (device *Device) maxHandshakeAttemps() uint32 {
+	res := uint32(MaxTimerHandshakes)
+
+	if t := device.timings.maxHandshakeAttemps.Load(); !t.IsZero() {
+		res = t.PickOne()
+	}
+
+	return res
 }

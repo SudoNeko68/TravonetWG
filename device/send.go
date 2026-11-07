@@ -11,9 +11,11 @@ import (
 	"errors"
 	"net"
 	"os"
+	"slices"
 	"sync"
 	"time"
 
+	"golang.org/x/crypto/chacha20"
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
@@ -46,12 +48,13 @@ import (
  */
 
 type QueueOutboundElement struct {
-	buffer  *[MaxMessageSize]byte // slice holding the packet data
-	packet  []byte                // slice of "buffer" (always!)
-	nonce   uint64                // nonce for encryption
-	keypair *Keypair              // keypair for encryption
-	peer    *Peer                 // related peer
-	padding int                   // AmneziaWG S4 prefix length used when the packet was read
+	buffer      *[MaxMessageSize]byte // slice holding the packet data
+	packet      []byte                // slice of "buffer" (always!)
+	nonce       uint64                // nonce for encryption
+	keypair     *Keypair              // keypair for encryption
+	peer        *Peer                 // related peer
+	padding     uint32
+	isKeepalive bool
 }
 
 type QueueOutboundElementsContainer struct {
@@ -63,7 +66,8 @@ func (device *Device) NewOutboundElement() *QueueOutboundElement {
 	elem := device.GetOutboundElement()
 	elem.buffer = device.GetMessageBuffer()
 	elem.nonce = 0
-	elem.padding = int(device.amnezia.paddings.transport.Load())
+	elem.padding = device.paddings.transport.Load()
+	elem.isKeepalive = false
 	// keypair and peer were cleared (if necessary) by clearPointers.
 	return elem
 }
@@ -84,6 +88,7 @@ func (elem *QueueOutboundElement) clearPointers() {
 func (peer *Peer) SendKeepalive() {
 	if len(peer.queue.staged) == 0 && peer.isRunning.Load() {
 		elem := peer.device.NewOutboundElement()
+		elem.isKeepalive = true
 		elemsContainer := peer.device.GetOutboundElementsContainer()
 		elemsContainer.elems = append(elemsContainer.elems, elem)
 		select {
@@ -101,17 +106,20 @@ func (peer *Peer) SendKeepalive() {
 func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 	if !isRetry {
 		peer.timers.handshakeAttempts.Store(0)
+		peer.timers.maxHandshakeAttempts.Store(peer.device.maxHandshakeAttemps())
 	}
 
+	timeout := peer.device.rekeyMinTimeout()
+
 	peer.handshake.mutex.RLock()
-	if time.Since(peer.handshake.lastSentHandshake) < RekeyTimeout {
+	if time.Since(peer.handshake.lastSentHandshake) < timeout {
 		peer.handshake.mutex.RUnlock()
 		return nil
 	}
 	peer.handshake.mutex.RUnlock()
 
 	peer.handshake.mutex.Lock()
-	if time.Since(peer.handshake.lastSentHandshake) < RekeyTimeout {
+	if time.Since(peer.handshake.lastSentHandshake) < timeout {
 		peer.handshake.mutex.Unlock()
 		return nil
 	}
@@ -126,14 +134,25 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 		return err
 	}
 
-	padding := int(peer.device.amnezia.paddings.init.Load())
+	var sendBuffer [][]byte
+
+	for _, ipacket := range peer.device.ipackets {
+		if ipacket != nil {
+			buf := make([]byte, ipacket.ObfuscatedLen(0))
+			ipacket.Obfuscate(buf, nil)
+			sendBuffer = append(sendBuffer, buf)
+		}
+	}
+
+	sendBuffer = append(sendBuffer, peer.device.JunkPackets()...)
+
+	padding := int(peer.device.paddings.init.Load())
 	trailerLen := max(peer.randomTrailer(padding+MessageInitiationSize), 0)
 
 	buf := make([]byte, padding+MessageInitiationSize+trailerLen)
+
 	crypt := buf[:padding]
-	if padding > 0 {
-		rand.Read(crypt)
-	}
+	rand.Read(crypt)
 
 	packet := buf[padding : padding+MessageInitiationSize]
 	_ = msg.marshal(packet)
@@ -142,23 +161,21 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 	peer.timersAnyAuthenticatedPacketTraversal()
 	peer.timersAnyAuthenticatedPacketSent()
 
-	cip, err := peer.device.HeaderProtectionCipher(crypt[:min(len(crypt), HeaderCipherNonceSize)])
-	if err != nil {
-		return err
+	var cip *chacha20.Cipher
+	if len(crypt) >= HeaderCipherNonceSize {
+		cip, err = peer.device.HeaderProtectionCipher(crypt[:HeaderCipherNonceSize])
+		if err != nil {
+			return err
+		}
 	}
 	if cip != nil {
 		cip.XORKeyStream(packet, packet)
 	}
 
-	if trailerLen > 0 {
-		rand.Read(buf[padding+MessageInitiationSize:])
-	}
+	trailer := buf[padding+MessageInitiationSize:]
+	rand.Read(trailer)
 
-	// AmneziaWG: I1..I5 + Jc junk datagrams go out right before the
-	// handshake, and S1 random bytes are prepended to the message itself.
-	sendBuffer := peer.device.handshakePrelude()
 	sendBuffer = append(sendBuffer, buf)
-
 	err = peer.SendBuffers(sendBuffer)
 	if err != nil {
 		peer.device.log.Errorf("%v - Failed to send handshake initiation: %v", peer, err)
@@ -181,14 +198,13 @@ func (peer *Peer) SendHandshakeResponse() error {
 		return err
 	}
 
-	padding := int(peer.device.amnezia.paddings.response.Load())
+	padding := int(peer.device.paddings.response.Load())
 	trailerLen := max(peer.randomTrailer(padding+MessageResponseSize), 0)
 
 	buf := make([]byte, padding+MessageResponseSize+trailerLen)
+
 	crypt := buf[:padding]
-	if padding > 0 {
-		rand.Read(crypt)
-	}
+	rand.Read(crypt)
 
 	packet := buf[padding : padding+MessageResponseSize]
 	_ = response.marshal(packet)
@@ -204,18 +220,21 @@ func (peer *Peer) SendHandshakeResponse() error {
 	peer.timersAnyAuthenticatedPacketTraversal()
 	peer.timersAnyAuthenticatedPacketSent()
 
-	cip, err := peer.device.HeaderProtectionCipher(crypt[:min(len(crypt), HeaderCipherNonceSize)])
-	if err != nil {
-		return err
+	var cip *chacha20.Cipher
+	if len(crypt) >= HeaderCipherNonceSize {
+		cip, err = peer.device.HeaderProtectionCipher(crypt[:HeaderCipherNonceSize])
+		if err != nil {
+			return err
+		}
 	}
 	if cip != nil {
 		cip.XORKeyStream(packet, packet)
 	}
 
-	if trailerLen > 0 {
-		rand.Read(buf[padding+MessageResponseSize:])
-	}
+	trailer := buf[padding+MessageResponseSize:]
+	rand.Read(trailer)
 
+	// TODO: allocation could be avoided
 	err = peer.SendBuffers([][]byte{buf})
 	if err != nil {
 		peer.device.log.Errorf("%v - Failed to send handshake response: %v", peer, err)
@@ -224,46 +243,49 @@ func (peer *Peer) SendHandshakeResponse() error {
 }
 
 func (device *Device) SendHandshakeCookie(initiatingElem *QueueHandshakeElement) error {
-	if device.amnezia.disableCookies.Load() {
-		return nil
-	}
-
 	device.log.Verbosef("Sending cookie response for denied handshake message for %v", initiatingElem.endpoint.DstToString())
 
 	sender := binary.LittleEndian.Uint32(initiatingElem.packet[4:8])
-	reply, err := device.cookieChecker.CreateReply(initiatingElem.packet, sender, initiatingElem.endpoint.DstToBytes())
+	msgType := device.headers.cookie.Load().PickOne()
+
+	reply, err := device.cookieChecker.CreateReply(
+		initiatingElem.packet,
+		sender,
+		initiatingElem.endpoint.DstToBytes(),
+		msgType,
+	)
 	if err != nil {
 		device.log.Errorf("Failed to create cookie reply: %v", err)
 		return err
 	}
 
-	padding := int(device.amnezia.paddings.cookie.Load())
+	padding := int(device.paddings.cookie.Load())
 	trailerLen := max(device.randomTrailer(padding+MessageCookieReplySize), 0)
 
 	buf := make([]byte, padding+MessageCookieReplySize+trailerLen)
+
 	crypt := buf[:padding]
-	if padding > 0 {
-		rand.Read(crypt)
-	}
+	rand.Read(crypt)
 
 	packet := buf[padding : padding+MessageCookieReplySize]
-	reply.Type = device.amnezia.headers.cookie.PickOne()
 	_ = reply.marshal(packet)
 
-	cip, err := device.HeaderProtectionCipher(crypt[:min(len(crypt), HeaderCipherNonceSize)])
-	if err != nil {
-		return err
+	var cip *chacha20.Cipher
+	if len(crypt) >= HeaderCipherNonceSize {
+		cip, err = device.HeaderProtectionCipher(crypt[:HeaderCipherNonceSize])
+		if err != nil {
+			return err
+		}
 	}
 	if cip != nil {
 		cip.XORKeyStream(packet, packet)
 	}
 
-	if trailerLen > 0 {
-		rand.Read(buf[padding+MessageCookieReplySize:])
-	}
+	trailer := buf[padding+MessageCookieReplySize:]
+	rand.Read(trailer)
 
+	// TODO: allocation could be avoided
 	device.net.bind.Send([][]byte{buf}, initiatingElem.endpoint)
-
 	return nil
 }
 
@@ -273,19 +295,21 @@ func (peer *Peer) keepKeyFreshSending() {
 		return
 	}
 	nonce := keypair.sendNonce.Load()
-	if nonce > RekeyAfterMessages || (keypair.isInitiator && time.Since(keypair.created) > peer.device.keyRefreshTimeoutSending()) {
+	if (nonce > RekeyAfterMessages || (keypair.isInitiator && time.Since(keypair.created) > peer.device.keyRefreshTimeoutSending())) &&
+		!peer.timers.sentLastMinuteHandshake.Load() {
+		peer.timers.sentLastMinuteHandshake.Store(true)
 		peer.SendHandshakeInitiation(false)
 	}
 }
 
 func (device *Device) RoutineReadFromTUN() {
+	randomNumber := fastrandn(1000)
+	device.log.Verbosef("Routine: TUN reader - started (%d)", randomNumber)
 	defer func() {
-		device.log.Verbosef("Routine: TUN reader - stopped")
+		device.log.Verbosef("Routine: TUN reader - stopped (%d)", randomNumber)
 		device.state.stopping.Done()
 		device.queue.encryption.wg.Done()
 	}()
-
-	device.log.Verbosef("Routine: TUN reader - started")
 
 	var (
 		batchSize   = device.BatchSize()
@@ -312,13 +336,18 @@ func (device *Device) RoutineReadFromTUN() {
 	}()
 
 	for {
+		if !device.isUp() {
+			time.Sleep(time.Millisecond * 5)
+			if device.isClosed() {
+				return
+			}
+			continue
+		}
+
+		padding := device.paddings.transport.Load()
+		offset := MessageTransportHeaderSize + int(padding)
+
 		// read packets
-		// AmneziaWG transport padding (S4) lives in front of the transport
-		// header, so the space reserved before the plaintext must grow with it.
-		// The value is captured per element: configuration may change while
-		// this goroutine is blocked in Read.
-		padding := int(device.amnezia.paddings.transport.Load())
-		offset := MessageTransportHeaderSize + padding
 		count, readErr = device.tun.device.Read(bufs, sizes, offset)
 		for i := 0; i < count; i++ {
 			if sizes[i] < 1 {
@@ -512,6 +541,49 @@ func calculatePaddingSize(packetSize, mtu int) int {
 	return paddedSize - lastUnit
 }
 
+func (peer *Peer) randomPaddingAddition(packetSize int) int {
+	addition := peer.device.contentPaddingAddition.Load()
+
+	if addition.IsZero() {
+		return -1
+	}
+
+	udpWindow := int(peer.udpWindow.Load())
+	if udpWindow < packetSize {
+		return 0
+	}
+
+	add := int(addition.PickOne())
+	space := udpWindow - packetSize
+	if add > space {
+		add = space
+	}
+	return add
+}
+
+func (device *Device) randomTrailer(packetSize int) int {
+	if !device.randomTrailers.Load() {
+		return -1
+	}
+
+	if DefaultUdpWindow < packetSize {
+		return 0
+	}
+	return int(fastrandn(uint32(DefaultUdpWindow - packetSize)))
+}
+
+func (peer *Peer) randomTrailer(packetSize int) int {
+	if !peer.device.randomTrailers.Load() {
+		return -1
+	}
+
+	udpWindow := int(peer.udpWindow.Load())
+	if udpWindow < packetSize {
+		return 0
+	}
+	return int(fastrandn(uint32(udpWindow - packetSize)))
+}
+
 /* Encrypts the elements in the queue
  * and marks them for sequential consumption (by releasing the mutex)
  *
@@ -525,24 +597,27 @@ func (device *Device) RoutineEncryption(id int) {
 
 	for elemsContainer := range device.queue.encryption.c {
 		for _, elem := range elemsContainer.elems {
-			// populate header fields
-			// AmneziaWG: S4 random bytes are prepended to every transport
-			// message, and the type field is H4 instead of 4.
-			padding := int(device.amnezia.paddings.transport.Load())
-
-			// Usually the packet was read with the same S4 value and can be
-			// encrypted in place.  If the configuration changed while the TUN
-			// reader was blocked (or a staged packet predates the config), the
-			// plaintext sits at a different offset, so copy it out first to
-			// avoid overlapping the new header/padding.
-			inPlace := elem.packet == nil || elem.padding == padding
-			plaintext := elem.packet
-			if !inPlace {
-				plaintext = append([]byte(nil), elem.packet...)
+			udpWindow := elem.padding + MinMessageSize + uint32(len(elem.packet))
+			if elem.peer.udpWindow.Load() < udpWindow {
+				elem.peer.udpWindow.Store(udpWindow)
 			}
 
-			// pad content
-			packetSize := len(plaintext) + MinMessageSize + padding
+			// fill crypto padding
+			crypt := elem.buffer[:elem.padding]
+			rand.Read(crypt)
+
+			// populate header fields
+			header := elem.buffer[elem.padding : elem.padding+MessageTransportHeaderSize]
+
+			fieldType := header[0:4]
+			fieldReceiver := header[4:8]
+			fieldNonce := header[8:16]
+
+			binary.LittleEndian.PutUint32(fieldType, device.headers.transport.Load().PickOne())
+			binary.LittleEndian.PutUint32(fieldReceiver, elem.keypair.remoteIndex)
+			binary.LittleEndian.PutUint64(fieldNonce, elem.nonce)
+
+			packetSize := len(elem.packet) + MinMessageSize + int(elem.padding)
 			mtu := int(device.tun.mtu.Load())
 
 			paddingSize := elem.peer.randomPaddingAddition(packetSize)
@@ -550,62 +625,39 @@ func (device *Device) RoutineEncryption(id int) {
 				paddingSize = elem.peer.randomTrailer(packetSize)
 			}
 			if paddingSize < 0 {
-				paddingSize = calculatePaddingSize(len(plaintext), mtu)
+				// pad content to multiple of 16
+				paddingSize = calculatePaddingSize(len(elem.packet), mtu)
 			}
 
-			oldLen := len(plaintext)
-			if cap(plaintext) >= oldLen+paddingSize {
-				plaintext = plaintext[:oldLen+paddingSize]
-			} else {
-				newPt := make([]byte, oldLen+paddingSize)
-				copy(newPt, plaintext)
-				plaintext = newPt
-			}
-			clear(plaintext[oldLen:])
-
-			var out []byte
-			neededCap := padding + MessageTransportHeaderSize + len(plaintext) + chacha20poly1305.Overhead
-			if inPlace && cap(elem.buffer) >= neededCap {
-				out = elem.buffer[:]
-			} else {
-				out = make([]byte, neededCap)
-			}
-
-			crypt := out[:padding]
-			if padding > 0 {
-				rand.Read(crypt)
-			}
-			transportHeader := out[padding : padding+MessageTransportHeaderSize]
-
-			fieldType := transportHeader[0:4]
-			fieldReceiver := transportHeader[4:8]
-			fieldNonce := transportHeader[8:16]
-
-			binary.LittleEndian.PutUint32(fieldType, device.amnezia.headers.transport.PickOne())
-			binary.LittleEndian.PutUint32(fieldReceiver, elem.keypair.remoteIndex)
-			binary.LittleEndian.PutUint64(fieldNonce, elem.nonce)
+			// append trailing zeroes
+			oldLen := len(elem.packet)
+			elem.packet = slices.Grow(elem.packet, paddingSize)
+			elem.packet = elem.packet[:oldLen+paddingSize]
+			clear(elem.packet[oldLen:])
 
 			// encrypt content and release to consumer
 
 			binary.LittleEndian.PutUint64(nonce[4:], elem.nonce)
-			sealed := elem.keypair.send.Seal(
-				transportHeader,
+			elem.packet = elem.keypair.send.Seal(
+				elem.buffer[:elem.padding+MessageTransportHeaderSize],
 				nonce[:],
-				plaintext,
+				elem.packet,
 				nil,
 			)
 
-			cip, err := device.HeaderProtectionCipher(crypt[:min(len(crypt), HeaderCipherNonceSize)])
-			if err != nil {
-				device.log.Errorf("Routine: header obfuscation failed - packet dropped")
-				elem.packet = nil
-				continue
+			var cip *chacha20.Cipher
+			var err error
+			if len(crypt) >= HeaderCipherNonceSize {
+				cip, err = device.HeaderProtectionCipher(crypt[:HeaderCipherNonceSize])
+				if err != nil {
+					device.log.Errorf("Routine: header obfuscation failed - packet dropped")
+					elem.packet = nil
+					continue
+				}
 			}
 			if cip != nil {
-				cip.XORKeyStream(transportHeader, transportHeader)
+				cip.XORKeyStream(header, header)
 			}
-
-			elem.packet = out[:padding+len(sealed)]
 		}
 		elemsContainer.Unlock()
 	}
@@ -644,9 +696,10 @@ func (peer *Peer) RoutineSequentialSender(maxBatchSize int) {
 		dataSent := false
 		elemsContainer.Lock()
 		for _, elem := range elemsContainer.elems {
-			if len(elem.packet) != MessageKeepaliveSize+int(device.amnezia.paddings.transport.Load()) {
+			if !elem.isKeepalive {
 				dataSent = true
 			}
+
 			bufs = append(bufs, elem.packet)
 		}
 
@@ -657,6 +710,7 @@ func (peer *Peer) RoutineSequentialSender(maxBatchSize int) {
 		if dataSent {
 			peer.timersDataSent()
 		}
+
 		for _, elem := range elemsContainer.elems {
 			device.PutMessageBuffer(elem.buffer)
 			device.PutOutboundElement(elem)

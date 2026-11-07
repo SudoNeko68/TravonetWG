@@ -69,11 +69,12 @@ func FilterUAPI(settings string) (cleanUAPI string, ev UAPIEvasion) {
 	var out []string
 
 	var (
-		peerOpen     bool
-		curKeepalive int
-		curHasKA     bool
-		curEndpoint  string
-		explicitPre  bool
+		peerOpen        bool
+		curKeepalive    int
+		curKeepaliveStr string
+		curHasKA        bool
+		curEndpoint     string
+		explicitPre     bool
 	)
 
 	finalizePeer := func() {
@@ -81,18 +82,22 @@ func FilterUAPI(settings string) (cleanUAPI string, ev UAPIEvasion) {
 			return
 		}
 		keepalive := curKeepalive
+		keepaliveStr := curKeepaliveStr
 		if !curHasKA {
 			keepalive = DefaultKeepalive
+			keepaliveStr = strconv.Itoa(DefaultKeepalive)
 		}
-		if IsPort500Endpoint(curEndpoint) && (keepalive == 0 || keepalive > LowPortKeepaliveLimit) {
+		if IsPort500Endpoint(curEndpoint) && (keepalive == 0 || keepalive > LowPortKeepaliveLimit || strings.Contains(keepaliveStr, "-")) {
 			keepalive = LowPortKeepalive
+			keepaliveStr = strconv.Itoa(LowPortKeepalive)
 		}
-		if keepalive > 0 {
-			out = append(out, fmt.Sprintf("persistent_keepalive_interval=%d", keepalive))
+		if keepaliveStr != "" && keepaliveStr != "0" {
+			out = append(out, fmt.Sprintf("persistent_keepalive_interval=%s", keepaliveStr))
 		}
 		ev.PersistentKeepalive = keepalive
 		peerOpen = false
 		curKeepalive = 0
+		curKeepaliveStr = ""
 		curHasKA = false
 		curEndpoint = ""
 	}
@@ -159,9 +164,13 @@ func FilterUAPI(settings string) (cleanUAPI string, ev UAPIEvasion) {
 			ev.Enabled = !parseBoolValue(val)
 			continue
 
-		case "debug", "evasion_debug":
+		case "debug", "evasion_debug", "evasiondebug":
 			ev.HasDebug = true
 			ev.Debug = parseBoolValue(val)
+			continue
+
+		case "socks5", "socks", "socks_proxy", "socks5_proxy", "socksauth", "socks_auth", "socks-auth":
+			// Evasion proxy settings are not accepted by device.IpcSet
 			continue
 
 		case "mtu":
@@ -185,8 +194,14 @@ func FilterUAPI(settings string) (cleanUAPI string, ev UAPIEvasion) {
 			continue
 
 		case "persistent_keepalive_interval", "persistentkeepalive":
+			curKeepaliveStr = val
+			curHasKA = true
 			if v, convErr := strconv.Atoi(val); convErr == nil {
-				curKeepalive, curHasKA = v, true
+				curKeepalive = v
+			} else if dashIdx := strings.Index(val, "-"); dashIdx > 0 {
+				if v, convErr := strconv.Atoi(strings.TrimSpace(val[:dashIdx])); convErr == nil {
+					curKeepalive = v
+				}
 			}
 			continue
 		}

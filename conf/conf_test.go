@@ -397,3 +397,33 @@ func TestLookupHostIPsPrioritizesIPv4(t *testing.T) {
 		t.Errorf("expected first IP to be IPv4, got %v", ips[0])
 	}
 }
+
+func TestKeepaliveRangeConfig(t *testing.T) {
+	content := `[Interface]
+PrivateKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+Address = 172.16.0.2/32
+
+[Peer]
+PublicKey = BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=
+Endpoint = 1.2.3.4:51820
+AllowedIPs = 0.0.0.0/0
+PersistentKeepalive = 20-30
+`
+	cfg, err := ParseConfigString(content)
+	if err != nil {
+		t.Fatalf("ParseConfigString failed: %v", err)
+	}
+	if cfg.PersistentKeepaliveRange != "20-30" {
+		t.Errorf("PersistentKeepaliveRange = %q, want 20-30", cfg.PersistentKeepaliveRange)
+	}
+	if cfg.PersistentKeepalive != 20 {
+		t.Errorf("PersistentKeepalive = %d, want 20", cfg.PersistentKeepalive)
+	}
+	uapi, err := cfg.ToUAPI()
+	if err != nil {
+		t.Fatalf("ToUAPI failed: %v", err)
+	}
+	if !strings.Contains(uapi, "persistent_keepalive_interval=20-30\n") {
+		t.Fatalf("ToUAPI did not contain range keepalive:\n%s", uapi)
+	}
+}

@@ -28,7 +28,9 @@ func TestPersistentKeepaliveTimerResilience(t *testing.T) {
 	}
 
 	// Set keepalive to 1 second
-	peer.persistentKeepaliveInterval.Store(1)
+	var rang UintRange
+	rang.FromString("1")
+	peer.persistentKeepaliveInterval.Store(rang)
 
 	// Verify that starting timers arms the persistent keepalive timer
 	peer.timersStart()
@@ -75,7 +77,7 @@ func TestPersistentKeepaliveUAPIUpdate(t *testing.T) {
 	defer dev.Down()
 
 	// Initial keepalive is 0
-	if peer.persistentKeepaliveInterval.Load() != 0 {
+	if !peer.persistentKeepaliveInterval.Load().IsZero() {
 		t.Fatalf("initial interval should be 0")
 	}
 
@@ -88,8 +90,8 @@ func TestPersistentKeepaliveUAPIUpdate(t *testing.T) {
 		t.Fatalf("handlePeerLine error: %v", err)
 	}
 
-	if peer.persistentKeepaliveInterval.Load() != 2 {
-		t.Fatalf("expected interval 2, got %d", peer.persistentKeepaliveInterval.Load())
+	if peer.persistentKeepaliveInterval.Load().Lo() != 2 {
+		t.Fatalf("expected interval 2, got %d", peer.persistentKeepaliveInterval.Load().Lo())
 	}
 
 	// Verify timer is active/pending

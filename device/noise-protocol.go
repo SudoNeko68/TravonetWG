@@ -6,6 +6,7 @@
 package device
 
 import (
+	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"golang.org/x/crypto/blake2s"
+	"golang.org/x/crypto/chacha20"
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/poly1305"
 
@@ -54,10 +56,11 @@ const (
 )
 
 const (
-	MessageInitiationType  = 1
-	MessageResponseType    = 2
-	MessageCookieReplyType = 3
-	MessageTransportType   = 4
+	MessageUnknownType     uint32 = 0
+	MessageInitiationType  uint32 = 1
+	MessageResponseType    uint32 = 2
+	MessageCookieReplyType uint32 = 3
+	MessageTransportType   uint32 = 4
 )
 
 const (
@@ -286,8 +289,10 @@ func (device *Device) CreateMessageInitiation(peer *Peer) (*MessageInitiation, e
 
 	handshake.mixHash(handshake.remoteStatic[:])
 
+	msgType := device.headers.init.Load().PickOne()
+
 	msg := MessageInitiation{
-		Type:      device.amnezia.headers.init.PickOne(),
+		Type:      msgType,
 		Ephemeral: handshake.localEphemeral.publicKey(),
 	}
 	// Cloudflare WARP uses the three reserved bytes of the initiation header
@@ -349,7 +354,7 @@ func (device *Device) ConsumeMessageInitiation(msg *MessageInitiation) *Peer {
 		chainKey [blake2s.Size]byte
 	)
 
-	if !device.amnezia.headers.init.Contains(msg.Type) {
+	if msg.Type != MessageInitiationType {
 		return nil
 	}
 
@@ -466,7 +471,7 @@ func (device *Device) CreateMessageResponse(peer *Peer) (*MessageResponse, error
 	}
 
 	var msg MessageResponse
-	msg.Type = device.amnezia.headers.response.PickOne()
+	msg.Type = device.headers.response.Load().PickOne()
 	msg.Sender = handshake.localIndex
 	msg.Receiver = handshake.remoteIndex
 
@@ -516,7 +521,7 @@ func (device *Device) CreateMessageResponse(peer *Peer) (*MessageResponse, error
 }
 
 func (device *Device) ConsumeMessageResponse(msg *MessageResponse) *Peer {
-	if !device.amnezia.headers.response.Contains(msg.Type) {
+	if msg.Type != MessageResponseType {
 		return nil
 	}
 
@@ -721,4 +726,49 @@ func (peer *Peer) ReceivedWithKeypair(receivedKeypair *Keypair) bool {
 	keypairs.current = keypairs.next.Load()
 	keypairs.next.Store(nil)
 	return true
+}
+
+func (device *Device) JunkPackets() [][]byte {
+	var bufs [][]byte
+
+	min := device.junk.min.Load()
+	max := device.junk.max.Load()
+	count := device.junk.count.Load()
+	if count == 0 {
+		return nil
+	}
+
+	diff := uint32(0)
+	if max > min {
+		diff = max - min
+	}
+
+	for range count {
+		var size uint32
+		if diff > 0 {
+			size = min + fastrandn(diff)
+		} else {
+			size = min
+		}
+		buf := make([]byte, size)
+		rand.Read(buf)
+		bufs = append(bufs, buf)
+	}
+
+	return bufs
+}
+
+func (device *Device) HeaderProtectionCipher(salt []byte) (*chacha20.Cipher, error) {
+	device.headerProtection.RLock()
+	defer device.headerProtection.RUnlock()
+
+	if device.headerProtection.key.IsZero() {
+		return nil, nil
+	}
+
+	if len(salt) < HeaderCipherNonceSize {
+		return nil, errors.New("salt is smaller than HeaderCipherNonceSize")
+	}
+
+	return chacha20.NewUnauthenticatedCipher(device.headerProtection.key[:], salt[:HeaderCipherNonceSize])
 }

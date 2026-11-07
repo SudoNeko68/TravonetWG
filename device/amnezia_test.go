@@ -53,15 +53,16 @@ func TestUintRange(t *testing.T) {
 }
 
 func TestSignaturePacketBuild(t *testing.T) {
-	packet, err := newSignaturePacket("<b 0xdeadbeef><r 8><rc 4><rd 5><t>")
+	chain, err := newObfChain("<b 0xdeadbeef><r 8><rc 4><rd 5><t>")
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	if packet == nil {
-		t.Fatal("nil packet")
+	if chain == nil {
+		t.Fatal("nil chain")
 	}
 
-	got := packet.Build()
+	got := make([]byte, chain.ObfuscatedLen(0))
+	chain.Obfuscate(got, nil)
 	if len(got) != 4+8+4+5+4 {
 		t.Fatalf("unexpected length %d", len(got))
 	}
@@ -69,7 +70,7 @@ func TestSignaturePacketBuild(t *testing.T) {
 		t.Fatalf("static bytes mismatch: %x", got[:4])
 	}
 	for _, b := range got[12:16] {
-		if !strings.ContainsRune(signatureChars52, rune(b)) {
+		if !strings.ContainsRune(chars52, rune(b)) {
 			t.Fatalf("random chars contains non-letter %q", b)
 		}
 	}
@@ -79,13 +80,13 @@ func TestSignaturePacketBuild(t *testing.T) {
 		}
 	}
 
-	if packet, err := newSignaturePacket(""); err != nil || packet != nil {
-		t.Fatalf("empty signature should be disabled: %v %v", packet, err)
+	if chain, err := newObfChain(""); err != nil || chain != nil {
+		t.Fatalf("empty signature should be disabled: %v %v", chain, err)
 	}
-	if _, err := newSignaturePacket("<unknown 1>"); err == nil {
+	if _, err := newObfChain("<unknown 1>"); err == nil {
 		t.Fatal("expected error for unknown tag")
 	}
-	if _, err := newSignaturePacket("<b 0xabc>"); err == nil {
+	if _, err := newObfChain("<b 0xabc>"); err == nil {
 		t.Fatal("expected error for odd hex string")
 	}
 }
@@ -181,10 +182,10 @@ func TestAmneziaTwoDevicePing(t *testing.T) {
 	}
 
 	// Verify that the obfuscation parameters made it into the device.
-	if got := pair[0].dev.amnezia.paddings.init.Load(); got != 32 {
+	if got := pair[0].dev.paddings.init.Load(); got != 32 {
 		t.Fatalf("s1 = %d, want 32", got)
 	}
-	if got := pair[0].dev.amnezia.headers.transport.Load(); !got.Contains(400000) {
+	if got := pair[0].dev.headers.transport.Load(); !got.Contains(400000) {
 		t.Fatalf("h4 = %s, want 400000", got)
 	}
 
