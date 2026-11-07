@@ -480,7 +480,7 @@ func (device *Device) handleDeviceLine(ipcDev *ipcSetDevice, key, value string) 
 
 	case "header_protection_key":
 		var key HeaderCipherKey
-		err := key.FromHex(value)
+		err := key.FromString(value)
 		if err != nil {
 			return ipcErrorf(ipc.IpcErrorInvalid, "failed to set header_protection_key: %w", err)
 		}
